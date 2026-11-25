@@ -11,9 +11,11 @@ import gzip
 import hashlib
 import mimetypes
 import os
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, NamedTuple
 
 import httpx
 from pydantic import TypeAdapter
@@ -68,6 +70,30 @@ _TOOL_BLOCK_ESCALATION_REASON: Final = (
 _TOOL_RESULT_BLOCK_ESCALATION_REASON: Final = (
     "This message was blocked by Ovalix because tool result anonymization isn't possible via LiteLLM"
 )
+_KEY_HASH_PREFIX_CHARS: Final = 12
+_SHA256_HEX_DIGEST: Final = re.compile(r"[0-9a-f]{64}")
+
+
+class _Identity(NamedTuple):
+    identifier: str
+    source: str
+
+
+_NAMED_IDENTITY_FIELDS: Final = (
+    ("user_api_key_user_email", "email"),
+    ("user_api_key_user_id", "user-id"),
+    ("user_api_key_end_user_id", "end-user-id"),
+)
+_UNKNOWN_IDENTITY: Final = _Identity("unknown", "unknown")
+
+
+@dataclass(frozen=True, slots=True)
+class _Caller:
+    """Who a checkpoint request is on behalf of."""
+
+    actor: str
+    identity_source: str
+    session_id: str
 
 
 def _encode_file_wire_format(raw: bytes) -> str:
@@ -76,6 +102,37 @@ def _encode_file_wire_format(raw: bytes) -> str:
 
 def _mapping_or_empty(value: object) -> Mapping[str, object]:
     return as_str_mapping(value) or _NO_METADATA
+
+
+def _stripped(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _named_identities(metadata: Mapping[str, object]) -> Iterator[_Identity]:
+    for field, source in _NAMED_IDENTITY_FIELDS:
+        value = _stripped(metadata.get(field))
+        if value:
+            yield _Identity(value, source)
+
+
+def _key_hash_prefix(key_hash: str) -> str:
+    """The first hex chars of the key's SHA-256; LiteLLM leaves some keys (JWTs, non-`sk-` keys) unhashed here."""
+    digest: Final = (
+        key_hash if _SHA256_HEX_DIGEST.fullmatch(key_hash) else hashlib.sha256(key_hash.encode()).hexdigest()
+    )
+    return digest[:_KEY_HASH_PREFIX_CHARS]
+
+
+def _resolve_identity(data: Mapping[str, object]) -> _Identity:
+    """The request's actor: the key's user email, user id, end-user id or key hash, whichever is set first."""
+    metadata: Final = _mapping_or_empty(data.get("metadata") or data.get("litellm_metadata"))
+    named: Final = next(_named_identities(metadata), None)
+    if named is not None:
+        return named
+    key_hash: Final = _stripped(metadata.get("user_api_key_hash"))
+    if key_hash:
+        return _Identity(f"api-key:{_key_hash_prefix(key_hash)}", "api-key")
+    return _UNKNOWN_IDENTITY
 
 
 class _CustomGuardrailOptions(TypedDict, total=False, extra_items=object):
@@ -203,22 +260,13 @@ class OvalixGuardrail(CustomGuardrail):
         )
         return [*requested, *auto_added]
 
-    def _get_actor(self, data: Mapping[str, object]) -> str:
-        """Return a stable actor identifier from request metadata (e.g. user email or id)."""
-        metadata: Final = _mapping_or_empty(data.get("metadata") or data.get("litellm_metadata"))
-        return (
-            str_or_none(metadata.get("user_api_key_user_email"))
-            or str_or_none(metadata.get("user_api_key_user_id"))
-            or "unknown"
-        )
-
     def _get_tracker_actor_id(self, data: Mapping[str, object]) -> str:
         """Normalize the actor string into a short, stable id for Tracker API payloads."""
         # NOTE: this hash is purely for normalization — it collapses an arbitrary actor
-        # string (email, user id, or "unknown") into a compact, fixed-length, consistent
+        # string (email, user id, end-user id, key hash prefix, or "unknown") into a compact, fixed-length, consistent
         # key. It is not a privacy/security measure and the actor value is not sensitive,
         # so a plain SHA-256 (truncated) is sufficient; no salting/KDF is needed here.
-        actor_id: Final = self._get_actor(data).encode()
+        actor_id: Final = _resolve_identity(data).identifier.encode()
         normalized_actor_id: Final = hashlib.sha256(actor_id).hexdigest()[:8]
         return normalized_actor_id
 
@@ -233,8 +281,7 @@ class OvalixGuardrail(CustomGuardrail):
         data_type: str,
         data: Mapping[str, object],
         checkpoint_id: str,
-        actor: str,
-        session_id: str,
+        caller: _Caller,
         oversize: bool = False,
     ) -> object:
         """Call the Ovalix Tracker checkpoint API and return the JSON response.
@@ -250,8 +297,9 @@ class OvalixGuardrail(CustomGuardrail):
         payload: Final = {
             "application_id": application_id,
             "checkpoint_id": checkpoint_id,
-            "actor": actor,
-            "session_id": session_id,
+            "actor": caller.actor,
+            "identity_source": caller.identity_source,
+            "session_id": caller.session_id,
             "data_type": data_type,
             "data": data,
             "tool": "LiteLLM",
@@ -275,15 +323,12 @@ class OvalixGuardrail(CustomGuardrail):
         data_type: str,
         data: Mapping[str, object],
         checkpoint_id: str,
-        actor: str,
-        session_id: str,
+        caller: _Caller,
         escalation_reason: str,
         oversize: bool = False,
     ) -> str | None:
         try:
-            resp: Final = await self._call_checkpoint(
-                data_type, data, checkpoint_id, actor, session_id, oversize=oversize
-            )
+            resp: Final = await self._call_checkpoint(data_type, data, checkpoint_id, caller, oversize=oversize)
         except Exception as e:
             verbose_proxy_logger.exception("Ovalix checkpoint call failed: %s", e)
             raise GuardrailRaisedException(
@@ -302,14 +347,11 @@ class OvalixGuardrail(CustomGuardrail):
         self,
         items: Sequence[tuple[str, Mapping[str, object]]],
         checkpoint_id: str,
-        actor: str,
-        session_id: str,
+        caller: _Caller,
         escalation_reason: str,
     ) -> str | None:
         for data_type, data in items:
-            reason = await self._block_reason_for_item(
-                data_type, data, checkpoint_id, actor, session_id, escalation_reason
-            )
+            reason = await self._block_reason_for_item(data_type, data, checkpoint_id, caller, escalation_reason)
             if reason is not None:
                 return reason
         return None
@@ -318,8 +360,7 @@ class OvalixGuardrail(CustomGuardrail):
         self,
         file_parts: Sequence[FilePart],
         checkpoint_id: str,
-        actor: str,
-        session_id: str,
+        caller: _Caller,
     ) -> str | None:
         if any(part.undecodable for part in file_parts):
             return _UNDECODABLE_FILE_BLOCK_REASON
@@ -329,8 +370,7 @@ class OvalixGuardrail(CustomGuardrail):
                 "FILE",
                 data,
                 checkpoint_id,
-                actor,
-                session_id,
+                caller,
                 _FILE_BLOCK_ESCALATION_REASON,
                 oversize=part.oversize,
             )
@@ -349,8 +389,8 @@ class OvalixGuardrail(CustomGuardrail):
         input_type: Literal["request", "response"],
         logging_obj: "LiteLLMLoggingObj | None" = None,
     ) -> GenericGuardrailAPIInputs:
-        actor: Final = self._get_actor(request_data)
-        session_id: Final = self._get_session_id(request_data)
+        identity: Final = _resolve_identity(request_data)
+        caller: Final = _Caller(identity.identifier, identity.source, self._get_session_id(request_data))
         is_response: Final = input_type == "response"
 
         prompt_checkpoint: Final = self._post_checkpoint_id if is_response else self._pre_checkpoint_id
@@ -369,7 +409,7 @@ class OvalixGuardrail(CustomGuardrail):
             if is_response
             else extract_file_parts_from_messages(structured_messages, size_limit=_DEFAULT_FILE_SIZE_LIMIT)
         )
-        file_block: Final = await self._check_files_for_block(file_parts, file_checkpoint, actor, session_id)
+        file_block: Final = await self._check_files_for_block(file_parts, file_checkpoint, caller)
         if file_block is not None:
             self._block_current_message(file_block)
 
@@ -392,8 +432,7 @@ class OvalixGuardrail(CustomGuardrail):
         tool_block: Final = await self._check_items_block_only(
             tool_call_items,
             prompt_checkpoint,
-            actor,
-            session_id,
+            caller,
             _TOOL_BLOCK_ESCALATION_REASON,
         )
         if tool_block is not None:
@@ -404,8 +443,7 @@ class OvalixGuardrail(CustomGuardrail):
         tool_result_block: Final = await self._check_items_block_only(
             tool_result_items,
             prompt_checkpoint,
-            actor,
-            session_id,
+            caller,
             _TOOL_RESULT_BLOCK_ESCALATION_REASON,
         )
         if tool_result_block is not None:
@@ -417,8 +455,7 @@ class OvalixGuardrail(CustomGuardrail):
         output_texts: Final = await self._check_texts(
             texts,
             prompt_checkpoint,
-            actor,
-            session_id,
+            caller,
             tool_result_text_indices(structured_messages, texts),
         )
         if output_texts is None:
@@ -439,16 +476,13 @@ class OvalixGuardrail(CustomGuardrail):
         self,
         texts: Sequence[str],
         checkpoint_id: str,
-        actor: str,
-        session_id: str,
+        caller: _Caller,
         skip_indices: frozenset[int],
     ) -> list[str] | None:
         newest_first: Final = tuple(index for index in reversed(range(len(texts))) if index not in skip_indices)
         checked: Final = MappingProxyType(
             {
-                index: await self._check_text(
-                    texts[index], checkpoint_id, actor, session_id, is_newest=index == len(texts) - 1
-                )
+                index: await self._check_text(texts[index], checkpoint_id, caller, is_newest=index == len(texts) - 1)
                 for index in newest_first
             }
         )
@@ -459,13 +493,12 @@ class OvalixGuardrail(CustomGuardrail):
         self,
         content: str,
         checkpoint_id: str,
-        actor: str,
-        session_id: str,
+        caller: _Caller,
         is_newest: bool,
     ) -> str:
         """Return the text that replaces `content` after Ovalix checks it; a blocked newest text raises."""
         try:
-            resp: Final = await self._call_checkpoint("TEXT", {"content": content}, checkpoint_id, actor, session_id)
+            resp: Final = await self._call_checkpoint("TEXT", {"content": content}, checkpoint_id, caller)
         except Exception as e:
             verbose_proxy_logger.exception("Ovalix checkpoint call failed: %s", e)
             raise GuardrailRaisedException(

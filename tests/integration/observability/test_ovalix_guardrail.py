@@ -23,6 +23,8 @@ from integration._support.client import Gateway, JsonValue, gateway_from_environ
 from integration._support.process import owned_proxy_process
 from integration._support.wire import Reply, Request, Wire, wire_server
 
+from litellm.proxy.utils import hash_token
+
 pytestmark: Final = pytest.mark.shares_worker_state
 
 API_KEY: Final = "synthetic-ovalix-key"
@@ -224,12 +226,16 @@ def _send(rig: Rig, endpoint: str, key: str, text: str, extra: dict[str, JsonVal
     return _post(rig, endpoint, key, text, extra)
 
 
+def _checkpoint_bodies(rig: Rig) -> list[dict[str, object]]:
+    return [json.loads(request.body) for request in rig.tracker.drain() if urlsplit(request.target).path == CHECKPOINT]
+
+
 def _checkpoint_actors(rig: Rig) -> list[object]:
-    return [
-        json.loads(request.body)["actor"]
-        for request in rig.tracker.drain()
-        if urlsplit(request.target).path == CHECKPOINT
-    ]
+    return [body["actor"] for body in _checkpoint_bodies(rig)]
+
+
+def _key_actor(key: str) -> str:
+    return f"api-key:{hash_token(key)[:12]}"
 
 
 @pytest.mark.parametrize("stream", (False, True))
@@ -241,7 +247,9 @@ def test_a_prompt_from_a_key_with_no_user_is_inspected(rig: Rig, endpoint: str, 
 
     assert response.status_code == 400 and DENIAL in response.text, response.text
     assert rig.provider.drain() == ()
-    assert _checkpoint_actors(rig) == ["unknown"]
+    assert [(body["actor"], body["identity_source"]) for body in _checkpoint_bodies(rig)] == [
+        (_key_actor(rig.keys.no_user), "api-key")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -276,11 +284,13 @@ def test_a_name_from_a_key_with_no_user_reaches_the_provider_anonymized(rig: Rig
 def test_the_actor_is_the_key_users_email_then_their_id(rig: Rig) -> None:
     by_id: Final = _send(rig, "/v1/chat/completions", rig.keys.with_user_id, f"hello {uuid.uuid4()}")
     assert by_id.status_code == 200, by_id.text
-    assert _checkpoint_actors(rig) == [rig.keys.user_id]
+    assert [(body["actor"], body["identity_source"]) for body in _checkpoint_bodies(rig)] == [
+        (rig.keys.user_id, "user-id")
+    ]
 
     by_email: Final = _send(rig, "/v1/chat/completions", rig.keys.with_email, f"hello {uuid.uuid4()}")
     assert by_email.status_code == 200, by_email.text
-    assert _checkpoint_actors(rig) == [rig.keys.email]
+    assert [(body["actor"], body["identity_source"]) for body in _checkpoint_bodies(rig)] == [(rig.keys.email, "email")]
 
 
 @pytest.mark.parametrize("endpoint", ENDPOINTS)
@@ -327,7 +337,7 @@ def test_a_tracker_outage_mid_burst_fails_closed_and_recovers(rig: Rig) -> None:
     assert len(failed) == len(during) - OUTAGE_AFTER, [response.text for response in during]
     assert all("Ovalix guardrail error" in response.text for response in failed), [response.text for response in failed]
     assert rig.provider.drain() == ()
-    assert set(_checkpoint_actors(rig)) == {"unknown"}
+    assert set(_checkpoint_actors(rig)) == {_key_actor(rig.keys.no_user)}
 
     after: Final = _burst(rig)
 
@@ -335,4 +345,4 @@ def test_a_tracker_outage_mid_burst_fails_closed_and_recovers(rig: Rig) -> None:
         response.text for response in after
     ]
     assert rig.provider.drain() == ()
-    assert _checkpoint_actors(rig) == ["unknown"] * len(after)
+    assert _checkpoint_actors(rig) == [_key_actor(rig.keys.no_user)] * len(after)

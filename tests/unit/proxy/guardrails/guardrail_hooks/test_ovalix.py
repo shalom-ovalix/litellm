@@ -19,6 +19,7 @@ from litellm.proxy.guardrails.guardrail_hooks.ovalix.ovalix import (
     OvalixGuardrail,
     OvalixGuardrailBlockedException,
     OvalixGuardrailMissingSecrets,
+    _Caller,
 )
 from litellm.proxy.guardrails.guardrail_hooks.ovalix.ovalix_extraction import FilePart
 from litellm.types.guardrails import GuardrailEventHooks
@@ -86,6 +87,9 @@ def _guardrail_kwargs():
         "event_hook": "pre_call",
         "default_on": True,
     }
+
+
+_CALLER: Final = _Caller(actor="actor", identity_source="user-id", session_id="sess")
 
 
 def test_static_mode_requires_a_checkpoint():
@@ -219,8 +223,7 @@ class TestOvalixGuardrail:
                     data_type="TEXT",
                     data={"content": "hello"},
                     checkpoint_id="pre-1",
-                    actor="a1b2c3d4",
-                    session_id="session-1",
+                    caller=_Caller(actor="a1b2c3d4", identity_source="user-id", session_id="session-1"),
                 )
 
             assert result == TRACKER_RESPONSE_ALLOW
@@ -231,6 +234,7 @@ class TestOvalixGuardrail:
             assert body["application_id"] == "app-1"
             assert body["checkpoint_id"] == "pre-1"
             assert body["actor"] == "a1b2c3d4"
+            assert body["identity_source"] == "user-id"
             assert body["session_id"] == "session-1"
             assert body["data_type"] == "TEXT"
             assert body["data"] == {"content": "hello"}
@@ -565,44 +569,12 @@ class TestOvalixGuardrail:
                 if k in os.environ:
                     del os.environ[k]
 
-    def test_get_actor_from_metadata(self):
-        """Actor is taken from metadata.user_api_key_user_email or user_api_key_user_id."""
-        for k, v in _ovalix_env().items():
-            os.environ[k] = v
-        try:
-            guardrail = OvalixGuardrail(**_guardrail_kwargs())
-            assert guardrail._get_actor({"metadata": {"user_api_key_user_email": "a@b.com"}}) == "a@b.com"
-            assert guardrail._get_actor({"metadata": {"user_api_key_user_id": "uid-1"}}) == "uid-1"
-            assert guardrail._get_actor({"litellm_metadata": {"user_api_key_user_id": "uid-2"}}) == "uid-2"
-            assert guardrail._get_actor({}) == "unknown"
-            assert (
-                guardrail._get_actor({"metadata": {"user_api_key_user_email": "", "user_api_key_user_id": ""}})
-                == "unknown"
-            )
-        finally:
-            for k in _ovalix_env():
-                if k in os.environ:
-                    del os.environ[k]
-
-    def test_get_actor_prefers_email_over_id(self, guardrail_with_env):
-        """When both user_api_key_user_email and user_api_key_user_id exist, email is used."""
-        guardrail = guardrail_with_env
-        data = {
-            "metadata": {
-                "user_api_key_user_email": "primary@test.com",
-                "user_api_key_user_id": "uid-99",
-            }
-        }
-        assert guardrail._get_actor(data) == "primary@test.com"
-
     def test_get_tracker_actor_id_is_hash_not_raw_pii(self, guardrail_with_env):
-        """Tracker API actor field uses a short hash of _get_actor, not email/user id."""
+        """The session id's actor part is a short hash of the actor, not the email/user id itself."""
         guardrail = guardrail_with_env
         data = {"metadata": {"user_api_key_user_email": "user@example.com"}}
-        raw = guardrail._get_actor(data)
         hashed = guardrail._get_tracker_actor_id(data)
-        assert raw == "user@example.com"
-        assert hashed != raw
+        assert hashed != "user@example.com"
         assert len(hashed) == 8
         assert all(c in "0123456789abcdef" for c in hashed)
 
@@ -785,7 +757,7 @@ async def test_file_checkpoint_call_routes_to_litellm_file_endpoint():
         return r
 
     with patch.object(g._async_handler, "post", new=_post):
-        await g._call_checkpoint("FILE", {"name": "f.txt", "content": "x"}, "file-1", "a", "s")
+        await g._call_checkpoint("FILE", {"name": "f.txt", "content": "x"}, "file-1", _CALLER)
     assert seen["url"] == "https://t/tracking/beta/file_checkpoint"
 
 
@@ -804,7 +776,7 @@ async def test_file_checkpoint_flags_oversize_parts(oversize):
         return r
 
     with patch.object(g._async_handler, "post", new=_post):
-        await g._check_files_for_block([part], "file-1", "a", "s")
+        await g._check_files_for_block([part], "file-1", _CALLER)
     assert seen["last"]["data"]["content"] is None
     assert seen["last"].get("oversize", False) is oversize
 
@@ -959,6 +931,105 @@ async def test_request_with_no_user_field_sends_unknown_actor(request_data):
     assert seen["last"]["actor"] == "unknown"
 
 
+_KEY_HASH: Final = "0123456789abcdef" * 4
+
+
+async def _sent_identity(request_data):
+    g: Final = _static_guardrail()
+    seen, post = _capturing_post()
+    with patch.object(g._async_handler, "post", new=post):
+        await g.apply_guardrail(
+            inputs=GenericGuardrailAPIInputs(texts=["hi"]), request_data=request_data, input_type="request"
+        )
+    return seen["body"]["actor"], seen["body"]["identity_source"], seen["body"]["session_id"].split("_", 1)[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata, actor, identity_source",
+    [
+        (
+            {
+                "user_api_key_user_email": "a@b.com",
+                "user_api_key_user_id": "uid-1",
+                "user_api_key_end_user_id": "cust-1",
+                "user_api_key_hash": _KEY_HASH,
+            },
+            "a@b.com",
+            "email",
+        ),
+        (
+            {"user_api_key_user_id": "uid-1", "user_api_key_end_user_id": "cust-1", "user_api_key_hash": _KEY_HASH},
+            "uid-1",
+            "user-id",
+        ),
+        ({"user_api_key_end_user_id": "cust-1", "user_api_key_hash": _KEY_HASH}, "cust-1", "end-user-id"),
+        ({"user_api_key_hash": _KEY_HASH}, "api-key:0123456789ab", "api-key"),
+        (
+            {
+                "user_api_key_user_email": "",
+                "user_api_key_user_id": "",
+                "user_api_key_end_user_id": "",
+                "user_api_key_hash": "",
+            },
+            "unknown",
+            "unknown",
+        ),
+    ],
+)
+async def test_actor_is_the_first_user_field_set_and_names_its_source(metadata, actor, identity_source):
+    sent: Final = await _sent_identity({"litellm_metadata": metadata})
+
+    assert sent[:2] == (actor, identity_source)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata, actor, identity_source",
+    [
+        ({"user_api_key_user_email": " a@b.com "}, "a@b.com", "email"),
+        ({"user_api_key_user_email": "  ", "user_api_key_user_id": " uid-1 "}, "uid-1", "user-id"),
+        ({"user_api_key_end_user_id": "\t", "user_api_key_hash": f" {_KEY_HASH} "}, "api-key:0123456789ab", "api-key"),
+        ({"user_api_key_user_email": " ", "user_api_key_hash": "  "}, "unknown", "unknown"),
+    ],
+)
+async def test_identity_values_are_stripped_and_a_blank_one_counts_as_unset(metadata, actor, identity_source):
+    sent: Final = await _sent_identity({"metadata": metadata})
+
+    assert sent[:2] == (actor, identity_source)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unhashed", ["custom-auth-secret-key", "hashed-jwt-" + "f" * 64])
+async def test_an_unhashed_key_is_hashed_before_it_becomes_the_actor(unhashed):
+    actor, identity_source, _ = await _sent_identity({"metadata": {"user_api_key_hash": unhashed}})
+
+    assert identity_source == "api-key"
+    assert actor.removeprefix("api-key:") not in unhashed
+    assert len(actor.removeprefix("api-key:")) == 12
+    assert actor == (await _sent_identity({"metadata": {"user_api_key_hash": unhashed}}))[0]
+
+
+@pytest.mark.asyncio
+async def test_two_jwts_resolve_to_two_actors():
+    first: Final = await _sent_identity({"metadata": {"user_api_key_hash": "hashed-jwt-" + "a" * 64}})
+    second: Final = await _sent_identity({"metadata": {"user_api_key_hash": "hashed-jwt-" + "b" * 64}})
+
+    assert first[0] != second[0]
+
+
+@pytest.mark.asyncio
+async def test_session_follows_the_resolved_actor_not_the_key():
+    key_only: Final = await _sent_identity({"metadata": {"user_api_key_hash": _KEY_HASH}})
+    same_key_again: Final = await _sent_identity({"metadata": {"user_api_key_hash": _KEY_HASH}})
+    end_user_on_that_key: Final = await _sent_identity(
+        {"metadata": {"user_api_key_hash": _KEY_HASH, "user_api_key_end_user_id": "cust-1"}}
+    )
+
+    assert key_only[2] == same_key_again[2]
+    assert end_user_on_that_key[2] != key_only[2]
+
+
 def _recording_post(mapping_fn=lambda body: _ALLOW):
     calls = []
 
@@ -1093,7 +1164,7 @@ def test_get_supported_event_hooks_lists_both():
 async def test_call_checkpoint_requires_application_and_checkpoint():
     g = _static_guardrail()
     with pytest.raises(ValueError, match="application_id or checkpoint_id not resolved"):
-        await g._call_checkpoint("TEXT", {"content": "x"}, "", "actor", "sess")
+        await g._call_checkpoint("TEXT", {"content": "x"}, "", _CALLER)
 
 
 @pytest.mark.asyncio
@@ -1288,7 +1359,7 @@ async def test_call_checkpoint_sends_the_configured_ids_and_no_name_or_direction
     seen, post = _capturing_post()
 
     with patch.object(g._async_handler, "post", new=post):
-        await g._call_checkpoint("TEXT", {"content": "x"}, "pre-1", "actor", "sess")
+        await g._call_checkpoint("TEXT", {"content": "x"}, "pre-1", _CALLER)
 
     assert seen["body"]["application_id"] == "app-1"
     assert seen["body"]["checkpoint_id"] == "pre-1"
