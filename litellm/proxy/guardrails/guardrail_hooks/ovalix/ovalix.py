@@ -187,6 +187,8 @@ class OvalixGuardrail(CustomGuardrail):
         pre_checkpoint_id: str | None = None,
         post_checkpoint_id: str | None = None,
         file_checkpoint_id: str | None = None,
+        pre_tool_checkpoint_id: str | None = None,
+        post_tool_checkpoint_id: str | None = None,
         supported_event_hooks: list[GuardrailEventHooks] | None = None,
         **kwargs: Unpack[_CustomGuardrailOptions],
     ):
@@ -196,6 +198,8 @@ class OvalixGuardrail(CustomGuardrail):
         self._pre_checkpoint_id = pre_checkpoint_id or os.environ.get("OVALIX_PRE_CHECKPOINT_ID")
         self._post_checkpoint_id = post_checkpoint_id or os.environ.get("OVALIX_POST_CHECKPOINT_ID")
         self._file_checkpoint_id = file_checkpoint_id or os.environ.get("OVALIX_FILE_CHECKPOINT_ID")
+        self._pre_tool_checkpoint_id = pre_tool_checkpoint_id or os.environ.get("OVALIX_PRE_TOOL_CHECKPOINT_ID")
+        self._post_tool_checkpoint_id = post_tool_checkpoint_id or os.environ.get("OVALIX_POST_TOOL_CHECKPOINT_ID")
 
         event_hooks: Final = self._validated_event_hooks(supported_event_hooks or ())
 
@@ -216,11 +220,14 @@ class OvalixGuardrail(CustomGuardrail):
 
         super().__init__(supported_event_hooks=event_hooks, **kwargs)
         verbose_proxy_logger.debug(
-            "Ovalix Guardrail initialized: tracker=%s, application_id=%s, pre_checkpoint_id=%s, post_checkpoint_id=%s",
+            "Ovalix Guardrail initialized: tracker=%s, application_id=%s, pre_checkpoint_id=%s, post_checkpoint_id=%s, "
+            "pre_tool_checkpoint_id=%s, post_tool_checkpoint_id=%s",
             self._tracker_api_base,
             self._application_id,
             self._pre_checkpoint_id,
             self._post_checkpoint_id,
+            self._pre_tool_checkpoint_id,
+            self._post_tool_checkpoint_id,
         )
 
     def _validated_event_hooks(self, requested: Sequence[GuardrailEventHooks]) -> list[GuardrailEventHooks]:
@@ -395,7 +402,9 @@ class OvalixGuardrail(CustomGuardrail):
 
         prompt_checkpoint: Final = self._post_checkpoint_id if is_response else self._pre_checkpoint_id
         file_checkpoint: Final = self._file_checkpoint_id or prompt_checkpoint
-        if not file_checkpoint:
+        tool_call_checkpoint: Final = self._pre_tool_checkpoint_id or prompt_checkpoint
+        tool_result_checkpoint: Final = self._post_tool_checkpoint_id or prompt_checkpoint
+        if not (file_checkpoint or tool_call_checkpoint or tool_result_checkpoint):
             verbose_proxy_logger.debug(
                 "Ovalix guardrail: application %s has no %s checkpoint, leaving this direction uninspected",
                 self._application_id,
@@ -404,53 +413,57 @@ class OvalixGuardrail(CustomGuardrail):
             return inputs
 
         structured_messages: Final = inputs.get("structured_messages") or ()
-        file_parts: Final = (
-            extract_file_parts_from_images(inputs.get("images"), size_limit=_DEFAULT_FILE_SIZE_LIMIT)
-            if is_response
-            else extract_file_parts_from_messages(structured_messages, size_limit=_DEFAULT_FILE_SIZE_LIMIT)
-        )
-        file_block: Final = await self._check_files_for_block(file_parts, file_checkpoint, caller)
-        if file_block is not None:
-            self._block_current_message(file_block)
-
-        if not prompt_checkpoint:
-            verbose_proxy_logger.debug(
-                "Ovalix guardrail: application %s has only a %s file checkpoint, skipping text and tool inspection",
-                self._application_id,
-                input_type,
+        if file_checkpoint:
+            file_parts: Final = (
+                extract_file_parts_from_images(inputs.get("images"), size_limit=_DEFAULT_FILE_SIZE_LIMIT)
+                if is_response
+                else extract_file_parts_from_messages(structured_messages, size_limit=_DEFAULT_FILE_SIZE_LIMIT)
             )
-            return inputs
+            file_block: Final = await self._check_files_for_block(file_parts, file_checkpoint, caller)
+            if file_block is not None:
+                self._block_current_message(file_block)
 
-        tool_calls: Final = (
-            *(inputs.get("tool_calls") or ()),
-            *extract_tool_calls_from_messages(structured_messages),
-        )
-        unique_tool_data: Final = MappingProxyType(
-            {tool_data_key(data): data for data in (tool_call_to_tool_data(tc) for tc in tool_calls) if data}
-        )
-        tool_call_items: Final = tuple(("TOOL", data) for data in unique_tool_data.values())
-        tool_block: Final = await self._check_items_block_only(
-            tool_call_items,
-            prompt_checkpoint,
-            caller,
-            _TOOL_BLOCK_ESCALATION_REASON,
-        )
-        if tool_block is not None:
-            self._block_current_message(tool_block)
+        if tool_call_checkpoint:
+            tool_calls: Final = (
+                *(inputs.get("tool_calls") or ()),
+                *extract_tool_calls_from_messages(structured_messages),
+            )
+            unique_tool_data: Final = MappingProxyType(
+                {tool_data_key(data): data for data in (tool_call_to_tool_data(tc) for tc in tool_calls) if data}
+            )
+            tool_call_items: Final = tuple(("TOOL", data) for data in unique_tool_data.values())
+            tool_block: Final = await self._check_items_block_only(
+                tool_call_items,
+                tool_call_checkpoint,
+                caller,
+                _TOOL_BLOCK_ESCALATION_REASON,
+            )
+            if tool_block is not None:
+                self._block_current_message(tool_block)
 
-        tool_results: Final = extract_tool_results(structured_messages)
-        tool_result_items: Final = tuple(("TOOL", make_tool_data(name, content)) for name, content, _ in tool_results)
-        tool_result_block: Final = await self._check_items_block_only(
-            tool_result_items,
-            prompt_checkpoint,
-            caller,
-            _TOOL_RESULT_BLOCK_ESCALATION_REASON,
-        )
-        if tool_result_block is not None:
-            self._block_current_message(tool_result_block)
+        if tool_result_checkpoint:
+            tool_results: Final = extract_tool_results(structured_messages)
+            tool_result_items: Final = tuple(
+                ("TOOL", make_tool_data(name, content)) for name, content, _ in tool_results
+            )
+            tool_result_block: Final = await self._check_items_block_only(
+                tool_result_items,
+                tool_result_checkpoint,
+                caller,
+                _TOOL_RESULT_BLOCK_ESCALATION_REASON,
+            )
+            if tool_result_block is not None:
+                self._block_current_message(tool_result_block)
 
         texts: Final = inputs.get("texts") or ()
         if not texts:
+            return inputs
+        if not prompt_checkpoint:
+            verbose_proxy_logger.debug(
+                "Ovalix guardrail: application %s has no %s prompt checkpoint, skipping text inspection",
+                self._application_id,
+                input_type,
+            )
             return inputs
         output_texts: Final = await self._check_texts(
             texts,

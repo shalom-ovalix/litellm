@@ -41027,10 +41027,20 @@ export interface components {
              */
             post_checkpoint_id?: string | null;
             /**
+             * Post Tool Checkpoint Id
+             * @description Post-tool-use checkpoint ID for tool results (falls back to pre/post).
+             */
+            post_tool_checkpoint_id?: string | null;
+            /**
              * Pre Checkpoint Id
              * @description Pre-checkpoint ID for the Ovalix Tracker service.
              */
             pre_checkpoint_id?: string | null;
+            /**
+             * Pre Tool Checkpoint Id
+             * @description Pre-tool-use checkpoint ID for tool calls, in requests and responses (falls back to pre/post).
+             */
+            pre_tool_checkpoint_id?: string | null;
             /**
              * Presidio Ad Hoc Recognizers
              * @description Path to a JSON file containing ad-hoc recognizers for Presidio

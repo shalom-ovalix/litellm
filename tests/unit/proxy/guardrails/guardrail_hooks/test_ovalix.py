@@ -1330,12 +1330,15 @@ def test_initialize_guardrail_wires_new_params(monkeypatch):
         pre_checkpoint_id = "pre-1"
         post_checkpoint_id = "post-1"
         file_checkpoint_id = "file-1"
+        pre_tool_checkpoint_id = "pre-tool-1"
+        post_tool_checkpoint_id = "post-tool-1"
         mode = "pre_call"
         default_on = True
         timeout = None
 
     guardrail = initialize_guardrail(_Params(), {"guardrail_name": "ovalix"})
     assert guardrail._file_checkpoint_id == "file-1"
+    assert (guardrail._pre_tool_checkpoint_id, guardrail._post_tool_checkpoint_id) == ("pre-tool-1", "post-tool-1")
     assert guardrail.guardrail_name == "ovalix"
 
 
@@ -1441,3 +1444,141 @@ async def test_a_blocked_responses_reasoning_text_before_the_last_one_blocks_the
     with patch.object(g._async_handler, "post", new=tracker):
         with pytest.raises(OvalixGuardrailBlockedException):
             await OpenAIResponsesHandler().process_output_response(response, g, request_data={})
+
+
+def _guardrail_with_tool_checkpoints(**checkpoint_ids):
+    return OvalixGuardrail(
+        tracker_api_base="https://t",
+        tracker_api_key="k",
+        application_id="app-1",
+        guardrail_name="o",
+        event_hook="pre_call",
+        default_on=True,
+        **checkpoint_ids,
+    )
+
+
+def _request_with_tool_history():
+    """A follow-up request: the user's question, the call the model made, and the result it got back."""
+    return GenericGuardrailAPIInputs(
+        texts=["what is the weather", "sunny"],
+        structured_messages=[
+            {"role": "user", "content": "what is the weather"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "c1", "function": {"name": "get_weather", "arguments": '{"city": "sf"}'}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+        ],
+    )
+
+
+def _response_with_new_tool_call():
+    return GenericGuardrailAPIInputs(
+        texts=["sending it now"],
+        tool_calls=[
+            {"id": "c2", "type": "function", "function": {"name": "send_email", "arguments": '{"to": "a@b.c"}'}}
+        ],
+    )
+
+
+async def _checkpoints_by_item(guardrail, inputs, input_type):
+    seen: Final = []
+
+    async def _post(url, headers=None, json=None, timeout=None):
+        seen.append((json["data_type"], json["data"]["content"], json["checkpoint_id"]))
+        response = MagicMock()
+        response.json.return_value = _ALLOW
+        response.raise_for_status = MagicMock()
+        return response
+
+    with patch.object(guardrail._async_handler, "post", new=_post):
+        await guardrail.apply_guardrail(inputs=inputs, request_data={}, input_type=input_type, logging_obj=None)
+    return seen
+
+
+_ALL_TOOL_CHECKPOINTS: Final = {
+    "pre_checkpoint_id": "pre-1",
+    "post_checkpoint_id": "post-1",
+    "pre_tool_checkpoint_id": "pre-tool-1",
+    "post_tool_checkpoint_id": "post-tool-1",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "input_type, inputs, expected",
+    [
+        (
+            "request",
+            _request_with_tool_history(),
+            [
+                ("TOOL", '{"city": "sf"}', "pre-tool-1"),
+                ("TOOL", "sunny", "post-tool-1"),
+                ("TEXT", "what is the weather", "pre-1"),
+            ],
+        ),
+        (
+            "response",
+            _response_with_new_tool_call(),
+            [("TOOL", '{"to": "a@b.c"}', "pre-tool-1"), ("TEXT", "sending it now", "post-1")],
+        ),
+    ],
+)
+async def test_tool_calls_go_to_pre_tool_use_and_tool_results_to_post_tool_use_in_either_direction(
+    input_type, inputs, expected
+):
+    """A call in a response is the call about to run, so it is judged at pre-tool-use like one in a request."""
+    sent: Final = await _checkpoints_by_item(
+        _guardrail_with_tool_checkpoints(**_ALL_TOOL_CHECKPOINTS), inputs, input_type
+    )
+
+    assert sent == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "input_type, inputs, expected",
+    [
+        (
+            "request",
+            _request_with_tool_history(),
+            [("TOOL", '{"city": "sf"}', "pre-1"), ("TOOL", "sunny", "pre-1"), ("TEXT", "what is the weather", "pre-1")],
+        ),
+        (
+            "response",
+            _response_with_new_tool_call(),
+            [("TOOL", '{"to": "a@b.c"}', "post-1"), ("TEXT", "sending it now", "post-1")],
+        ),
+    ],
+)
+async def test_tool_items_fall_back_to_the_prompt_checkpoint_of_their_direction(input_type, inputs, expected):
+    guardrail: Final = _guardrail_with_tool_checkpoints(pre_checkpoint_id="pre-1", post_checkpoint_id="post-1")
+
+    assert await _checkpoints_by_item(guardrail, inputs, input_type) == expected
+
+
+@pytest.mark.asyncio
+async def test_tool_items_are_inspected_in_a_direction_without_a_prompt_checkpoint():
+    """Only a direct apply_guardrail call reaches the request side of a guardrail with just a post checkpoint."""
+    guardrail: Final = _pinned_guardrail(
+        event_hook="post_call",
+        post_checkpoint_id="post-1",
+        pre_tool_checkpoint_id="pre-tool-1",
+        post_tool_checkpoint_id="post-tool-1",
+    )
+
+    sent: Final = await _checkpoints_by_item(guardrail, _request_with_tool_history(), "request")
+
+    assert sent == [("TOOL", '{"city": "sf"}', "pre-tool-1"), ("TOOL", "sunny", "post-tool-1")]
+
+
+@pytest.mark.asyncio
+async def test_tool_checkpoint_ids_fall_back_to_env(monkeypatch):
+    monkeypatch.setenv("OVALIX_PRE_TOOL_CHECKPOINT_ID", "pre-tool-env")
+    monkeypatch.setenv("OVALIX_POST_TOOL_CHECKPOINT_ID", "post-tool-env")
+    guardrail: Final = _guardrail_with_tool_checkpoints(pre_checkpoint_id="pre-1")
+
+    sent: Final = await _checkpoints_by_item(guardrail, _request_with_tool_history(), "request")
+
+    assert [checkpoint for data_type, _, checkpoint in sent if data_type == "TOOL"] == ["pre-tool-env", "post-tool-env"]

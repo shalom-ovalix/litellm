@@ -20161,6 +20161,18 @@
               "description": "Post-checkpoint ID for the Ovalix Tracker service.",
               "title": "Post Checkpoint Id"
             },
+            "post_tool_checkpoint_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Post-tool-use checkpoint ID for tool results (falls back to pre/post).",
+              "title": "Post Tool Checkpoint Id"
+            },
             "pre_checkpoint_id": {
               "anyOf": [
                 {
@@ -20172,6 +20184,18 @@
               ],
               "description": "Pre-checkpoint ID for the Ovalix Tracker service.",
               "title": "Pre Checkpoint Id"
+            },
+            "pre_tool_checkpoint_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Pre-tool-use checkpoint ID for tool calls, in requests and responses (falls back to pre/post).",
+              "title": "Pre Tool Checkpoint Id"
             },
             "presidio_ad_hoc_recognizers": {
               "anyOf": [
