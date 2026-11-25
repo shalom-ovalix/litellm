@@ -2123,3 +2123,148 @@ async def test_every_checkpoint_request_names_its_item_kind_and_only_a_capped_ne
         ("TOOL", "tool_result", False, False),
         ("TEXT", "message", False, False),
     ]
+
+
+def _streaming_params(**settings):
+    class _Params:
+        tracker_api_base = "https://t"
+        tracker_api_key = "k"
+        application_id = "app-1"
+        pre_checkpoint_id = "pre-1"
+        post_checkpoint_id = "post-1"
+        mode = "post_call"
+        default_on = True
+        timeout = None
+
+    params: Final = _Params()
+    for name, value in settings.items():
+        setattr(params, name, value)
+    return params
+
+
+def _initialized(params, monkeypatch):
+    import litellm
+    from litellm.proxy.guardrails.guardrail_hooks.ovalix import initialize_guardrail
+
+    monkeypatch.setattr(litellm.logging_callback_manager, "add_litellm_callback", lambda callback: None)
+    return initialize_guardrail(params, {"guardrail_name": "ovalix"})
+
+
+def test_streaming_settings_default_like_the_generic_guardrail(monkeypatch):
+    guardrail: Final = _initialized(_streaming_params(), monkeypatch)
+
+    assert (
+        guardrail.streaming_end_of_stream_only,
+        guardrail.streaming_sampling_rate,
+        guardrail.streaming_transform_mode,
+        hasattr(guardrail, "streaming_buffer_until_moderated"),
+    ) == (False, 5, "block_only", False)
+
+
+def test_configured_streaming_settings_become_guardrail_attributes(monkeypatch):
+    guardrail: Final = _initialized(
+        _streaming_params(
+            streaming_end_of_stream_only=True,
+            streaming_sampling_rate=2,
+            streaming_transform_mode="incremental_diff",
+            streaming_buffer_until_moderated=False,
+        ),
+        monkeypatch,
+    )
+
+    assert (
+        guardrail.streaming_end_of_stream_only,
+        guardrail.streaming_sampling_rate,
+        guardrail.streaming_transform_mode,
+        guardrail.streaming_buffer_until_moderated,
+    ) == (True, 2, "incremental_diff", False)
+
+
+def test_a_streaming_sampling_rate_below_one_is_rejected_at_startup(monkeypatch):
+    with pytest.raises(ValueError, match="streaming_sampling_rate"):
+        _initialized(_streaming_params(streaming_sampling_rate=0), monkeypatch)
+
+
+async def _response_bodies_and_result(inputs, request_data, verdict=lambda body: _ALLOW):
+    route: Final = _CapsRoute()
+    guardrail: Final = _capped_guardrail(route)
+    post, bodies = _checkpoint_bodies_post(verdict)
+    with patch.object(route, "post", new=post):
+        result = await guardrail.apply_guardrail(inputs=inputs, request_data=request_data, input_type="response")
+    return bodies, result
+
+
+@pytest.mark.asyncio
+async def test_each_response_item_carries_a_stream_id_of_the_call_id_its_kind_and_its_index():
+    inputs: Final = GenericGuardrailAPIInputs(
+        texts=["", "first choice", "second choice"],
+        tool_calls=[
+            {"id": "c1", "type": "function", "function": {"name": "first", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"name": "second", "arguments": "{}"}},
+        ],
+        images=["https://x.test/pic.png"],
+    )
+
+    bodies, _ = await _response_bodies_and_result(inputs, {"litellm_call_id": "call-7"})
+
+    assert [(body["item_kind"], body.get("stream_id")) for body in bodies] == [
+        ("file", None),
+        ("tool_call", "call-7:tool_call:0"),
+        ("tool_call", "call-7:tool_call:1"),
+        ("message", "call-7:text:2"),
+        ("message", "call-7:text:1"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_request_items_and_responses_without_a_call_id_carry_no_stream_id():
+    route: Final = _CapsRoute()
+    guardrail: Final = _capped_guardrail(route)
+    post, bodies = _checkpoint_bodies_post()
+
+    with patch.object(route, "post", new=post):
+        await guardrail.apply_guardrail(
+            GenericGuardrailAPIInputs(texts=["hi"]), {"litellm_call_id": "call-7"}, "request"
+        )
+        await guardrail.apply_guardrail(GenericGuardrailAPIInputs(texts=["hi"]), {}, "response")
+
+    assert ["stream_id" in body for body in bodies] == [False, False]
+
+
+@pytest.mark.asyncio
+async def test_response_texts_hold_back_their_last_512_characters():
+    texts: Final = ["short reply ", "x" * 512, "y" * 600, ""]
+
+    _, result = await _response_bodies_and_result(GenericGuardrailAPIInputs(texts=texts), {})
+
+    assert result["texts"] == texts
+    assert result["stream_holdback_chars"] == [12, 512, 512, 0]
+
+
+@pytest.mark.asyncio
+async def test_the_holdback_is_measured_on_the_text_returned_to_the_client():
+    _, result = await _response_bodies_and_result(
+        GenericGuardrailAPIInputs(texts=["my name is David"]),
+        {},
+        verdict=lambda body: {"action_type": "anonymize", "modified_data": {"content": "my name is {Name}"}},
+    )
+
+    assert (result["texts"], result["stream_holdback_chars"]) == (["my name is {Name}"], [len("my name is {Name}")])
+
+
+@pytest.mark.asyncio
+async def test_a_request_gets_no_stream_holdback():
+    result, _ = await _apply_capped(_DEFAULT_CAPS, GenericGuardrailAPIInputs(texts=["Hello wor"]))
+
+    assert "stream_holdback_chars" not in result
+
+
+@pytest.mark.asyncio
+async def test_a_response_over_a_cap_that_passes_under_allow_still_holds_back_its_texts():
+    result, _ = await _apply_capped(
+        _caps(messages_per_call=1, hit_behavior="allow"),
+        GenericGuardrailAPIInputs(texts=["first choice", "z" * 700]),
+        input_type="response",
+    )
+
+    assert result["stream_holdback_chars"] == [12, 512]

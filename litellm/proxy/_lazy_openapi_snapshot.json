@@ -20657,6 +20657,22 @@
               "description": "Whether this guardrail runs on streaming requests, non-streaming requests, or both. A string applies to every configured mode. A map overrides named modes (pre_call, during_call, post_call, ...); omitted keys default to both. Unset means both, matching historical behavior.",
               "title": "Stream Scope"
             },
+            "streaming_transform_mode": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "block_only",
+                    "incremental_diff"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "'block_only' (default) streams the response as the model sends it and only a block stops it. 'incremental_diff' streams the text as Ovalix returns it, so anonymized text reaches the client, holding back each text's last 512 characters until the next check or the end of the stream.",
+              "title": "Streaming Transform Mode"
+            },
             "template_id": {
               "anyOf": [
                 {

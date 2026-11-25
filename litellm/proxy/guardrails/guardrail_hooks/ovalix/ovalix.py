@@ -68,6 +68,8 @@ BLOCKED_ACTION_TYPE: Final = "block"
 _MODIFY_ACTION_TYPES: Final = ("anonymize", "sanitize")
 _CAPS_TTL_SECONDS: Final = 300.0
 _TRIM_PLACEHOLDER: Final = "[Removed: over the inspection limit]"
+_DEFAULT_STREAMING_SAMPLING_RATE: Final = 5
+_STREAM_HOLDBACK_CHARS: Final = 512
 _NO_METADATA: Final[Mapping[str, object]] = MappingProxyType({})
 _DECODED_JSON: Final = TypeAdapter(object)
 _FILE_BLOCK_ESCALATION_REASON: Final = (
@@ -113,16 +115,18 @@ class _ItemTag:
     """What a checkpoint request carries about its item, and on the newest item of a capped call the cap it hit."""
 
     item_kind: ItemKind
+    stream_id: str | None = None
     cap_hit: CapLimit | None = None
     cap_handling: CapHandling | None = None
 
     def wire_fields(self) -> Mapping[str, object]:
+        stream_fields: Final = MappingProxyType({"stream_id": self.stream_id}) if self.stream_id else _NO_METADATA
         cap_fields: Final = (
             MappingProxyType({"cap_hit": self.cap_hit.value, "cap_handling": self.cap_handling})
             if self.cap_hit is not None
             else _NO_METADATA
         )
-        return MappingProxyType({"item_kind": self.item_kind.value, **cap_fields})
+        return MappingProxyType({"item_kind": self.item_kind.value, **stream_fields, **cap_fields})
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +157,36 @@ class _Call:
                 ItemKind.FILE: tuple(part.size for part in self.files),
             }
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _Tagger:
+    """Tags each item of a call: its kind, its stream id when it is part of a response, and the cap flags."""
+
+    plan: CapPlan
+    call: _Call
+    stream_call_id: str | None
+
+    def tag(self, ref: ItemRef) -> _ItemTag:
+        flagged: Final = ref == self.plan.newest
+        return _ItemTag(
+            ref.kind,
+            self._stream_id(ref),
+            self.plan.cap_hit if flagged else None,
+            self.plan.handling if flagged else None,
+        )
+
+    def _stream_id(self, ref: ItemRef) -> str | None:
+        """`<litellm_call_id>:<kind>:<index>`, so every scan of one streamed item shares a key."""
+        if self.stream_call_id is None:
+            return None
+        match ref.kind:
+            case ItemKind.MESSAGE:
+                return f"{self.stream_call_id}:text:{self.call.messages[ref.position][0]}"
+            case ItemKind.TOOL_CALL:
+                return f"{self.stream_call_id}:tool_call:{ref.position}"
+            case ItemKind.TOOL_RESULT | ItemKind.FILE:
+                return None
 
 
 _T = TypeVar("_T")
@@ -207,15 +241,10 @@ def _extract_call(inputs: GenericGuardrailAPIInputs, is_response: bool, routes: 
     )
 
 
-def _tag(plan: CapPlan, ref: ItemRef) -> _ItemTag:
-    flagged: Final = ref == plan.newest
-    return _ItemTag(ref.kind, plan.cap_hit if flagged else None, plan.handling if flagged else None)
-
-
-def _kept(plan: CapPlan, kind: ItemKind, items: Sequence[_T]) -> tuple[tuple[_T, _ItemTag], ...]:
+def _kept(tagger: _Tagger, kind: ItemKind, items: Sequence[_T]) -> tuple[tuple[_T, _ItemTag], ...]:
     """The items of one kind the plan inspects, oldest first, each with its request tag."""
     refs: Final = tuple(ItemRef(kind, position) for position in range(len(items)))
-    return tuple((items[ref.position], _tag(plan, ref)) for ref in refs if ref in plan.kept)
+    return tuple((items[ref.position], tagger.tag(ref)) for ref in refs if ref in tagger.plan.kept)
 
 
 def _trimmed_text_indices(plan: CapPlan, messages: Sequence[tuple[int, str]]) -> frozenset[int]:
@@ -224,6 +253,14 @@ def _trimmed_text_indices(plan: CapPlan, messages: Sequence[tuple[int, str]]) ->
         return frozenset()
     refs: Final = tuple(ItemRef(ItemKind.MESSAGE, position) for position in range(len(messages)))
     return frozenset(messages[ref.position][0] for ref in refs if ref not in plan.kept)
+
+
+def _with_stream_holdback(result: GenericGuardrailAPIInputs) -> GenericGuardrailAPIInputs:
+    """Withhold the end of each response text from streaming, so the next check can still rewrite it."""
+    texts: Final = result.get("texts") or ()
+    if not texts:
+        return result
+    return {**result, "stream_holdback_chars": [min(len(text), _STREAM_HOLDBACK_CHARS) for text in texts]}
 
 
 def _mapping_or_empty(value: object) -> Mapping[str, object]:
@@ -315,6 +352,10 @@ class OvalixGuardrail(CustomGuardrail):
         file_checkpoint_id: str | None = None,
         pre_tool_checkpoint_id: str | None = None,
         post_tool_checkpoint_id: str | None = None,
+        streaming_end_of_stream_only: bool | None = None,
+        streaming_sampling_rate: int | None = None,
+        streaming_transform_mode: Literal["block_only", "incremental_diff"] | None = None,
+        streaming_buffer_until_moderated: bool | None = None,
         supported_event_hooks: list[GuardrailEventHooks] | None = None,
         async_handler: AsyncHTTPHandler | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -328,6 +369,15 @@ class OvalixGuardrail(CustomGuardrail):
         self._file_checkpoint_id = file_checkpoint_id or os.environ.get("OVALIX_FILE_CHECKPOINT_ID")
         self._pre_tool_checkpoint_id = pre_tool_checkpoint_id or os.environ.get("OVALIX_PRE_TOOL_CHECKPOINT_ID")
         self._post_tool_checkpoint_id = post_tool_checkpoint_id or os.environ.get("OVALIX_POST_TOOL_CHECKPOINT_ID")
+        self.streaming_end_of_stream_only: bool = bool(streaming_end_of_stream_only)
+        self.streaming_sampling_rate: int = (
+            _DEFAULT_STREAMING_SAMPLING_RATE if streaming_sampling_rate is None else streaming_sampling_rate
+        )
+        self.streaming_transform_mode: Literal["block_only", "incremental_diff"] = (
+            "block_only" if streaming_transform_mode is None else streaming_transform_mode
+        )
+        if streaming_buffer_until_moderated is not None:
+            self.streaming_buffer_until_moderated: bool = streaming_buffer_until_moderated
 
         event_hooks: Final = self._validated_event_hooks(supported_event_hooks or ())
 
@@ -588,27 +638,26 @@ class OvalixGuardrail(CustomGuardrail):
                 data: Final = await self._file_part_to_data(part)
                 return await self._send("FILE", data, routes.file, caller, tag, oversize=part.oversize)
 
-    async def _check_newest_only(
-        self, call: _Call, plan: CapPlan, newest: ItemRef, routes: _Routes, caller: _Caller
-    ) -> None:
+    async def _check_newest_only(self, tagger: _Tagger, newest: ItemRef, routes: _Routes, caller: _Caller) -> None:
         """Send only the newest item, flagged with the cap the call hit; the tracker's verdict on it decides the call."""
-        action, corrected = await self._send_item(call, newest, routes, caller, _tag(plan, newest))
+        action, corrected = await self._send_item(tagger.call, newest, routes, caller, tagger.tag(newest))
         if action == BLOCKED_ACTION_TYPE:
             self._block_current_message(corrected or BLOCKED_BY_OVALIX_FALLBACK_MESSAGE)
 
-    async def _check_block_only_items(self, call: _Call, plan: CapPlan, routes: _Routes, caller: _Caller) -> None:
+    async def _check_block_only_items(self, tagger: _Tagger, routes: _Routes, caller: _Caller) -> None:
+        call: Final = tagger.call
         file_block: Final = await self._check_files_for_block(
-            _kept(plan, ItemKind.FILE, call.files), routes.file, caller
+            _kept(tagger, ItemKind.FILE, call.files), routes.file, caller
         )
         if file_block is not None:
             self._block_current_message(file_block)
         tool_block: Final = await self._check_tool_items(
-            _kept(plan, ItemKind.TOOL_CALL, call.tool_calls), routes.tool_call, caller, _TOOL_BLOCK_ESCALATION_REASON
+            _kept(tagger, ItemKind.TOOL_CALL, call.tool_calls), routes.tool_call, caller, _TOOL_BLOCK_ESCALATION_REASON
         )
         if tool_block is not None:
             self._block_current_message(tool_block)
         tool_result_block: Final = await self._check_tool_items(
-            _kept(plan, ItemKind.TOOL_RESULT, call.tool_results),
+            _kept(tagger, ItemKind.TOOL_RESULT, call.tool_results),
             routes.tool_result,
             caller,
             _TOOL_RESULT_BLOCK_ESCALATION_REASON,
@@ -646,10 +695,11 @@ class OvalixGuardrail(CustomGuardrail):
         if any(part.undecodable for part in call.files):
             self._block_current_message(_UNDECODABLE_FILE_BLOCK_REASON)
         plan: Final = plan_caps(call.sizes(), caps)
+        tagger: Final = _Tagger(plan, call, str_or_none(request_data.get("litellm_call_id")) if is_response else None)
         if plan.newest is not None and plan.newest_only:
-            await self._check_newest_only(call, plan, plan.newest, routes, caller)
-            return inputs
-        await self._check_block_only_items(call, plan, routes, caller)
+            await self._check_newest_only(tagger, plan.newest, routes, caller)
+            return _with_stream_holdback(inputs) if is_response else inputs
+        await self._check_block_only_items(tagger, routes, caller)
 
         texts: Final = inputs.get("texts") or ()
         if not routes.message:
@@ -662,15 +712,14 @@ class OvalixGuardrail(CustomGuardrail):
             return inputs
         output_texts: Final = await self._check_texts(
             texts,
-            _kept(plan, ItemKind.MESSAGE, call.messages),
+            _kept(tagger, ItemKind.MESSAGE, call.messages),
             _trimmed_text_indices(plan, call.messages),
             routes.message,
             caller,
             caps,
         )
-        if output_texts is None:
-            return inputs
-        return {**inputs, "texts": output_texts}
+        result: Final[GenericGuardrailAPIInputs] = inputs if output_texts is None else {**inputs, "texts": output_texts}
+        return _with_stream_holdback(result) if is_response else result
 
     async def _file_part_to_data(self, part: FilePart) -> Mapping[str, object]:
         extension: Final = mimetypes.guess_extension(part.mime_hint) if part.mime_hint else None

@@ -41224,6 +41224,11 @@ export interface components {
                 [key: string]: "streaming" | "non_streaming" | "both";
             } | null;
             /**
+             * Streaming Transform Mode
+             * @description 'block_only' (default) streams the response as the model sends it and only a block stops it. 'incremental_diff' streams the text as Ovalix returns it, so anonymized text reaches the client, holding back each text's last 512 characters until the next check or the end of the stream.
+             */
+            streaming_transform_mode?: ("block_only" | "incremental_diff") | null;
+            /**
              * Template Id
              * @description The ID of your Model Armor template
              */

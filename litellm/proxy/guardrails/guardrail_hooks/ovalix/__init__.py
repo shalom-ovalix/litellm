@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING, Final
 
 from litellm.types.guardrails import SupportedGuardrailIntegrations
+from litellm.types.proxy.guardrails.guardrail_hooks.ovalix import OvalixGuardrailStreamingParams
 
 from .ovalix import OvalixGuardrail
 
@@ -22,6 +23,10 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
     file_checkpoint_id: Final = getattr(litellm_params, "file_checkpoint_id", None)
     pre_tool_checkpoint_id: Final = getattr(litellm_params, "pre_tool_checkpoint_id", None)
     post_tool_checkpoint_id: Final = getattr(litellm_params, "post_tool_checkpoint_id", None)
+    streaming_transform_mode: Final = getattr(litellm_params, "streaming_transform_mode", None)
+    streaming: Final = OvalixGuardrailStreamingParams.model_validate(
+        {name: getattr(litellm_params, name, None) for name in OvalixGuardrailStreamingParams.model_fields}
+    )
 
     _ovalix_callback: Final = OvalixGuardrail(
         guardrail_name=guardrail["guardrail_name"],
@@ -33,6 +38,10 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
         file_checkpoint_id=file_checkpoint_id,
         pre_tool_checkpoint_id=pre_tool_checkpoint_id,
         post_tool_checkpoint_id=post_tool_checkpoint_id,
+        streaming_end_of_stream_only=streaming.streaming_end_of_stream_only,
+        streaming_sampling_rate=streaming.streaming_sampling_rate,
+        streaming_transform_mode=streaming_transform_mode,
+        streaming_buffer_until_moderated=streaming.streaming_buffer_until_moderated,
         event_hook=litellm_params.mode,
         default_on=litellm_params.default_on,
         timeout=litellm_params.timeout,
