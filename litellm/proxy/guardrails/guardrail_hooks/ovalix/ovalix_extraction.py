@@ -43,6 +43,7 @@ class FilePart(NamedTuple):
     oversize: bool
     message_index: int
     undecodable: bool = False
+    size: int = 0
 
 
 def _split_data_url(value: str) -> tuple[str | None, str | None]:
@@ -55,6 +56,10 @@ def _split_data_url(value: str) -> tuple[str | None, str | None]:
     if not match.group("b64"):
         return mime, None
     return mime, value[match.end() :]
+
+
+def _decoded_size(cleaned: str) -> int:
+    return (len(cleaned) * 3) // 4 - cleaned[-2:].count("=")
 
 
 def _b64decode_or_none(payload: str) -> bytes | None:
@@ -79,13 +84,13 @@ def _inline_part(name: str | None, value: str, size_limit: int | None, message_i
     if not cleaned:
         return None
     if size_limit is not None and (len(cleaned) * 3) // 4 - 2 > size_limit:
-        return FilePart(name, None, mime_hint, True, True, message_index)
+        return FilePart(name, None, mime_hint, True, True, message_index, size=_decoded_size(cleaned))
     data: Final = _decoded_base64(cleaned)
     if data is None:
         return FilePart(name, None, mime_hint, True, False, message_index, undecodable=True)
     if size_limit is not None and len(data) > size_limit:
-        return FilePart(name, None, mime_hint, True, True, message_index)
-    return FilePart(name, data, mime_hint, True, False, message_index)
+        return FilePart(name, None, mime_hint, True, True, message_index, size=len(data))
+    return FilePart(name, data, mime_hint, True, False, message_index, size=len(data))
 
 
 def _name_from_url(url: str) -> str | None:

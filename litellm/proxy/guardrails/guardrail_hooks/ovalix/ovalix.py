@@ -12,10 +12,11 @@ import hashlib
 import mimetypes
 import os
 import re
-from collections.abc import Iterator, Mapping, Sequence
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Literal, NamedTuple
+from typing import TYPE_CHECKING, Final, Literal, NamedTuple, TypeVar
 
 import httpx
 from pydantic import TypeAdapter
@@ -29,8 +30,18 @@ from litellm.integrations.custom_guardrail import (
 )
 from litellm.litellm_core_utils.core_helpers import SupportsGet, as_str_mapping, require_get
 from litellm.llms.custom_httpx.http_handler import (
+    AsyncHTTPHandler,
     get_async_httpx_client,
     httpxSpecialProvider,
+)
+from litellm.proxy.guardrails.guardrail_hooks.ovalix.ovalix_caps import (
+    CapHandling,
+    CapLimit,
+    CapPlan,
+    ItemKind,
+    ItemRef,
+    OvalixCaps,
+    plan_caps,
 )
 from litellm.proxy.guardrails.guardrail_hooks.ovalix.ovalix_extraction import (
     FilePart,
@@ -55,7 +66,8 @@ if TYPE_CHECKING:
 BLOCKED_BY_OVALIX_FALLBACK_MESSAGE: Final = "This message was blocked by Ovalix"
 BLOCKED_ACTION_TYPE: Final = "block"
 _MODIFY_ACTION_TYPES: Final = ("anonymize", "sanitize")
-_DEFAULT_FILE_SIZE_LIMIT: Final = 64 * 1024 * 1024
+_CAPS_TTL_SECONDS: Final = 300.0
+_TRIM_PLACEHOLDER: Final = "[Removed: over the inspection limit]"
 _NO_METADATA: Final[Mapping[str, object]] = MappingProxyType({})
 _DECODED_JSON: Final = TypeAdapter(object)
 _FILE_BLOCK_ESCALATION_REASON: Final = (
@@ -96,8 +108,122 @@ class _Caller:
     session_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class _ItemTag:
+    """What a checkpoint request carries about its item, and on the newest item of a capped call the cap it hit."""
+
+    item_kind: ItemKind
+    cap_hit: CapLimit | None = None
+    cap_handling: CapHandling | None = None
+
+    def wire_fields(self) -> Mapping[str, object]:
+        cap_fields: Final = (
+            MappingProxyType({"cap_hit": self.cap_hit.value, "cap_handling": self.cap_handling})
+            if self.cap_hit is not None
+            else _NO_METADATA
+        )
+        return MappingProxyType({"item_kind": self.item_kind.value, **cap_fields})
+
+
+@dataclass(frozen=True, slots=True)
+class _Routes:
+    """The checkpoint each item kind goes to in one direction; None leaves that kind uninspected."""
+
+    message: str | None
+    tool_call: str | None
+    tool_result: str | None
+    file: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _Call:
+    """The items of one call, each kind oldest first; a message is its position in `texts` and its text."""
+
+    messages: tuple[tuple[int, str], ...]
+    tool_calls: tuple[Mapping[str, object], ...]
+    tool_results: tuple[Mapping[str, object], ...]
+    files: tuple[FilePart, ...]
+
+    def sizes(self) -> Mapping[ItemKind, Sequence[int]]:
+        return MappingProxyType(
+            {
+                ItemKind.MESSAGE: tuple(_utf8_size(text) for _, text in self.messages),
+                ItemKind.TOOL_CALL: tuple(map(_tool_content_size, self.tool_calls)),
+                ItemKind.TOOL_RESULT: tuple(map(_tool_content_size, self.tool_results)),
+                ItemKind.FILE: tuple(part.size for part in self.files),
+            }
+        )
+
+
+_T = TypeVar("_T")
+
+
 def _encode_file_wire_format(raw: bytes) -> str:
     return base64.b64encode(gzip.compress(raw)).decode()
+
+
+def _utf8_size(text: str) -> int:
+    return len(text.encode())
+
+
+def _tool_content_size(data: Mapping[str, object]) -> int:
+    return _utf8_size(str_or_none(data.get("content")) or "")
+
+
+def _may_hold_items(inputs: GenericGuardrailAPIInputs) -> bool:
+    return bool(
+        inputs.get("texts") or inputs.get("tool_calls") or inputs.get("structured_messages") or inputs.get("images")
+    )
+
+
+def _unique_tool_calls(tool_calls: Sequence[object]) -> tuple[Mapping[str, object], ...]:
+    unique: Final = MappingProxyType(
+        {tool_data_key(data): data for data in (tool_call_to_tool_data(tc) for tc in tool_calls) if data}
+    )
+    return tuple(unique.values())
+
+
+def _file_parts(inputs: GenericGuardrailAPIInputs, is_response: bool, size_limit: int) -> tuple[FilePart, ...]:
+    if is_response:
+        return extract_file_parts_from_images(inputs.get("images"), size_limit=size_limit)
+    return extract_file_parts_from_messages(inputs.get("structured_messages") or (), size_limit=size_limit)
+
+
+def _messages(texts: Sequence[str], tool_result_texts: frozenset[int]) -> tuple[tuple[int, str], ...]:
+    return tuple((index, text) for index, text in enumerate(texts) if text.strip() and index not in tool_result_texts)
+
+
+def _extract_call(inputs: GenericGuardrailAPIInputs, is_response: bool, routes: _Routes, file_size_limit: int) -> _Call:
+    """The call's items of every kind that has a checkpoint in this direction."""
+    structured_messages: Final = inputs.get("structured_messages") or ()
+    texts: Final = inputs.get("texts") or ()
+    tool_calls: Final = (*(inputs.get("tool_calls") or ()), *extract_tool_calls_from_messages(structured_messages))
+    tool_results: Final = extract_tool_results(structured_messages) if routes.tool_result else ()
+    return _Call(
+        messages=_messages(texts, tool_result_text_indices(structured_messages, texts)) if routes.message else (),
+        tool_calls=_unique_tool_calls(tool_calls) if routes.tool_call else (),
+        tool_results=tuple(make_tool_data(name, content) for name, content, _ in tool_results),
+        files=_file_parts(inputs, is_response, file_size_limit) if routes.file else (),
+    )
+
+
+def _tag(plan: CapPlan, ref: ItemRef) -> _ItemTag:
+    flagged: Final = ref == plan.newest
+    return _ItemTag(ref.kind, plan.cap_hit if flagged else None, plan.handling if flagged else None)
+
+
+def _kept(plan: CapPlan, kind: ItemKind, items: Sequence[_T]) -> tuple[tuple[_T, _ItemTag], ...]:
+    """The items of one kind the plan inspects, oldest first, each with its request tag."""
+    refs: Final = tuple(ItemRef(kind, position) for position in range(len(items)))
+    return tuple((items[ref.position], _tag(plan, ref)) for ref in refs if ref in plan.kept)
+
+
+def _trimmed_text_indices(plan: CapPlan, messages: Sequence[tuple[int, str]]) -> frozenset[int]:
+    """Positions in `texts` of the messages a trim dropped, which reach the model as the placeholder."""
+    if plan.handling != "trim":
+        return frozenset()
+    refs: Final = tuple(ItemRef(ItemKind.MESSAGE, position) for position in range(len(messages)))
+    return frozenset(messages[ref.position][0] for ref in refs if ref not in plan.kept)
 
 
 def _mapping_or_empty(value: object) -> Mapping[str, object]:
@@ -190,6 +316,8 @@ class OvalixGuardrail(CustomGuardrail):
         pre_tool_checkpoint_id: str | None = None,
         post_tool_checkpoint_id: str | None = None,
         supported_event_hooks: list[GuardrailEventHooks] | None = None,
+        async_handler: AsyncHTTPHandler | None = None,
+        clock: Callable[[], float] = time.monotonic,
         **kwargs: Unpack[_CustomGuardrailOptions],
     ):
         self._tracker_api_base = tracker_api_base or os.environ.get("OVALIX_TRACKER_API_BASE")
@@ -216,7 +344,12 @@ class OvalixGuardrail(CustomGuardrail):
             )
         )
 
-        self._async_handler = get_async_httpx_client(llm_provider=httpxSpecialProvider.GuardrailCallback)
+        self._async_handler = async_handler or get_async_httpx_client(
+            llm_provider=httpxSpecialProvider.GuardrailCallback
+        )
+        self._clock = clock
+        self._caps: OvalixCaps | None = None
+        self._caps_checked_at = 0.0
 
         super().__init__(supported_event_hooks=event_hooks, **kwargs)
         verbose_proxy_logger.debug(
@@ -283,12 +416,52 @@ class OvalixGuardrail(CustomGuardrail):
         today: Final = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         return f"{actor_hash}_{today}_{self._application_id}"
 
+    def _routes(self, is_response: bool) -> _Routes:
+        prompt_checkpoint: Final = self._post_checkpoint_id if is_response else self._pre_checkpoint_id
+        return _Routes(
+            message=prompt_checkpoint,
+            tool_call=self._pre_tool_checkpoint_id or prompt_checkpoint,
+            tool_result=self._post_tool_checkpoint_id or prompt_checkpoint,
+            file=self._file_checkpoint_id or prompt_checkpoint,
+        )
+
+    async def _fetch_caps(self) -> OvalixCaps:
+        response: Final = await self._async_handler.get(
+            f"{self._tracker_api_base}/tracking/beta/caps", headers=self._tracker_headers, timeout=self.timeout
+        )
+        response.raise_for_status()
+        return OvalixCaps.model_validate(response.json())
+
+    async def _current_caps(self) -> OvalixCaps:
+        """The org's caps, refetched once the copy in hand is older than the TTL and kept when a refetch fails."""
+        now: Final = self._clock()
+        cached: Final = self._caps
+        if cached is not None and now - self._caps_checked_at < _CAPS_TTL_SECONDS:
+            return cached
+        try:
+            fetched: Final = await self._fetch_caps()
+        except Exception as e:
+            if cached is None:
+                verbose_proxy_logger.exception("Ovalix caps fetch failed: %s", e)
+                raise GuardrailRaisedException(
+                    guardrail_name=self.guardrail_name,
+                    message=f"Ovalix guardrail error: {e}",
+                    should_wrap_with_default_message=False,
+                ) from e
+            verbose_proxy_logger.warning("Ovalix caps fetch failed, keeping the last caps: %s", e)
+            self._caps_checked_at = now
+            return cached
+        self._caps = fetched
+        self._caps_checked_at = now
+        return fetched
+
     async def _call_checkpoint(
         self,
         data_type: str,
         data: Mapping[str, object],
-        checkpoint_id: str,
+        checkpoint_id: str | None,
         caller: _Caller,
+        tag: _ItemTag,
         oversize: bool = False,
     ) -> object:
         """Call the Ovalix Tracker checkpoint API and return the JSON response.
@@ -310,6 +483,7 @@ class OvalixGuardrail(CustomGuardrail):
             "data_type": data_type,
             "data": data,
             "tool": "LiteLLM",
+            **tag.wire_fields(),
             **(MappingProxyType({"oversize": True}) if oversize else _NO_METADATA),
         }
         response: Final = await self._async_handler.post(
@@ -325,17 +499,18 @@ class OvalixGuardrail(CustomGuardrail):
         decoded: Final = require_get(resp)
         return (str_or_none(decoded.get("action_type")) or "").lower(), self._get_trackers_corrected_message(decoded)
 
-    async def _block_reason_for_item(
+    async def _send(
         self,
         data_type: str,
         data: Mapping[str, object],
-        checkpoint_id: str,
+        checkpoint_id: str | None,
         caller: _Caller,
-        escalation_reason: str,
+        tag: _ItemTag,
         oversize: bool = False,
-    ) -> str | None:
+    ) -> tuple[str, str | None]:
+        """Send one item and return the tracker's action and corrected content; a failed call fails closed."""
         try:
-            resp: Final = await self._call_checkpoint(data_type, data, checkpoint_id, caller, oversize=oversize)
+            resp: Final = await self._call_checkpoint(data_type, data, checkpoint_id, caller, tag, oversize=oversize)
         except Exception as e:
             verbose_proxy_logger.exception("Ovalix checkpoint call failed: %s", e)
             raise GuardrailRaisedException(
@@ -343,47 +518,103 @@ class OvalixGuardrail(CustomGuardrail):
                 message=f"Ovalix guardrail error: {e}",
                 should_wrap_with_default_message=False,
             ) from e
-        action, corrected = self._verdict(resp)
+        return self._verdict(resp)
+
+    async def _block_reason_for_item(
+        self,
+        data_type: str,
+        data: Mapping[str, object],
+        checkpoint_id: str | None,
+        caller: _Caller,
+        tag: _ItemTag,
+        escalation_reason: str,
+        oversize: bool = False,
+    ) -> str | None:
+        action, corrected = await self._send(data_type, data, checkpoint_id, caller, tag, oversize=oversize)
         if action == BLOCKED_ACTION_TYPE:
             return corrected or BLOCKED_BY_OVALIX_FALLBACK_MESSAGE
         if action in _MODIFY_ACTION_TYPES:
             return escalation_reason
         return None
 
-    async def _check_items_block_only(
+    async def _check_tool_items(
         self,
-        items: Sequence[tuple[str, Mapping[str, object]]],
-        checkpoint_id: str,
+        items: Sequence[tuple[Mapping[str, object], _ItemTag]],
+        checkpoint_id: str | None,
         caller: _Caller,
         escalation_reason: str,
     ) -> str | None:
-        for data_type, data in items:
-            reason = await self._block_reason_for_item(data_type, data, checkpoint_id, caller, escalation_reason)
+        for data, tag in items:
+            reason = await self._block_reason_for_item("TOOL", data, checkpoint_id, caller, tag, escalation_reason)
             if reason is not None:
                 return reason
         return None
 
     async def _check_files_for_block(
         self,
-        file_parts: Sequence[FilePart],
-        checkpoint_id: str,
+        file_parts: Sequence[tuple[FilePart, _ItemTag]],
+        checkpoint_id: str | None,
         caller: _Caller,
     ) -> str | None:
-        if any(part.undecodable for part in file_parts):
-            return _UNDECODABLE_FILE_BLOCK_REASON
-        for part in sorted(file_parts, key=lambda p: p.message_index, reverse=True):
+        for part, tag in sorted(file_parts, key=lambda kept: kept[0].message_index, reverse=True):
             data = await self._file_part_to_data(part)
             reason = await self._block_reason_for_item(
                 "FILE",
                 data,
                 checkpoint_id,
                 caller,
+                tag,
                 _FILE_BLOCK_ESCALATION_REASON,
                 oversize=part.oversize,
             )
             if reason is not None:
                 return reason
         return None
+
+    async def _send_item(
+        self, call: _Call, ref: ItemRef, routes: _Routes, caller: _Caller, tag: _ItemTag
+    ) -> tuple[str, str | None]:
+        match ref.kind:
+            case ItemKind.MESSAGE:
+                return await self._send(
+                    "TEXT", {"content": call.messages[ref.position][1]}, routes.message, caller, tag
+                )
+            case ItemKind.TOOL_CALL:
+                return await self._send("TOOL", call.tool_calls[ref.position], routes.tool_call, caller, tag)
+            case ItemKind.TOOL_RESULT:
+                return await self._send("TOOL", call.tool_results[ref.position], routes.tool_result, caller, tag)
+            case ItemKind.FILE:
+                part: Final = call.files[ref.position]
+                data: Final = await self._file_part_to_data(part)
+                return await self._send("FILE", data, routes.file, caller, tag, oversize=part.oversize)
+
+    async def _check_newest_only(
+        self, call: _Call, plan: CapPlan, newest: ItemRef, routes: _Routes, caller: _Caller
+    ) -> None:
+        """Send only the newest item, flagged with the cap the call hit; the tracker's verdict on it decides the call."""
+        action, corrected = await self._send_item(call, newest, routes, caller, _tag(plan, newest))
+        if action == BLOCKED_ACTION_TYPE:
+            self._block_current_message(corrected or BLOCKED_BY_OVALIX_FALLBACK_MESSAGE)
+
+    async def _check_block_only_items(self, call: _Call, plan: CapPlan, routes: _Routes, caller: _Caller) -> None:
+        file_block: Final = await self._check_files_for_block(
+            _kept(plan, ItemKind.FILE, call.files), routes.file, caller
+        )
+        if file_block is not None:
+            self._block_current_message(file_block)
+        tool_block: Final = await self._check_tool_items(
+            _kept(plan, ItemKind.TOOL_CALL, call.tool_calls), routes.tool_call, caller, _TOOL_BLOCK_ESCALATION_REASON
+        )
+        if tool_block is not None:
+            self._block_current_message(tool_block)
+        tool_result_block: Final = await self._check_tool_items(
+            _kept(plan, ItemKind.TOOL_RESULT, call.tool_results),
+            routes.tool_result,
+            caller,
+            _TOOL_RESULT_BLOCK_ESCALATION_REASON,
+        )
+        if tool_result_block is not None:
+            self._block_current_message(tool_result_block)
 
     def scans_each_text_separately(self) -> bool:
         return False
@@ -399,77 +630,43 @@ class OvalixGuardrail(CustomGuardrail):
         identity: Final = _resolve_identity(request_data)
         caller: Final = _Caller(identity.identifier, identity.source, self._get_session_id(request_data))
         is_response: Final = input_type == "response"
-
-        prompt_checkpoint: Final = self._post_checkpoint_id if is_response else self._pre_checkpoint_id
-        file_checkpoint: Final = self._file_checkpoint_id or prompt_checkpoint
-        tool_call_checkpoint: Final = self._pre_tool_checkpoint_id or prompt_checkpoint
-        tool_result_checkpoint: Final = self._post_tool_checkpoint_id or prompt_checkpoint
-        if not (file_checkpoint or tool_call_checkpoint or tool_result_checkpoint):
+        routes: Final = self._routes(is_response)
+        if not (routes.file or routes.tool_call or routes.tool_result):
             verbose_proxy_logger.debug(
                 "Ovalix guardrail: application %s has no %s checkpoint, leaving this direction uninspected",
                 self._application_id,
                 input_type,
             )
             return inputs
+        if not _may_hold_items(inputs):
+            return inputs
 
-        structured_messages: Final = inputs.get("structured_messages") or ()
-        if file_checkpoint:
-            file_parts: Final = (
-                extract_file_parts_from_images(inputs.get("images"), size_limit=_DEFAULT_FILE_SIZE_LIMIT)
-                if is_response
-                else extract_file_parts_from_messages(structured_messages, size_limit=_DEFAULT_FILE_SIZE_LIMIT)
-            )
-            file_block: Final = await self._check_files_for_block(file_parts, file_checkpoint, caller)
-            if file_block is not None:
-                self._block_current_message(file_block)
-
-        if tool_call_checkpoint:
-            tool_calls: Final = (
-                *(inputs.get("tool_calls") or ()),
-                *extract_tool_calls_from_messages(structured_messages),
-            )
-            unique_tool_data: Final = MappingProxyType(
-                {tool_data_key(data): data for data in (tool_call_to_tool_data(tc) for tc in tool_calls) if data}
-            )
-            tool_call_items: Final = tuple(("TOOL", data) for data in unique_tool_data.values())
-            tool_block: Final = await self._check_items_block_only(
-                tool_call_items,
-                tool_call_checkpoint,
-                caller,
-                _TOOL_BLOCK_ESCALATION_REASON,
-            )
-            if tool_block is not None:
-                self._block_current_message(tool_block)
-
-        if tool_result_checkpoint:
-            tool_results: Final = extract_tool_results(structured_messages)
-            tool_result_items: Final = tuple(
-                ("TOOL", make_tool_data(name, content)) for name, content, _ in tool_results
-            )
-            tool_result_block: Final = await self._check_items_block_only(
-                tool_result_items,
-                tool_result_checkpoint,
-                caller,
-                _TOOL_RESULT_BLOCK_ESCALATION_REASON,
-            )
-            if tool_result_block is not None:
-                self._block_current_message(tool_result_block)
+        caps: Final = await self._current_caps()
+        call: Final = _extract_call(inputs, is_response, routes, caps.file_size_bytes)
+        if any(part.undecodable for part in call.files):
+            self._block_current_message(_UNDECODABLE_FILE_BLOCK_REASON)
+        plan: Final = plan_caps(call.sizes(), caps)
+        if plan.newest is not None and plan.newest_only:
+            await self._check_newest_only(call, plan, plan.newest, routes, caller)
+            return inputs
+        await self._check_block_only_items(call, plan, routes, caller)
 
         texts: Final = inputs.get("texts") or ()
-        if not texts:
-            return inputs
-        if not prompt_checkpoint:
-            verbose_proxy_logger.debug(
-                "Ovalix guardrail: application %s has no %s prompt checkpoint, skipping text inspection",
-                self._application_id,
-                input_type,
-            )
+        if not routes.message:
+            if texts:
+                verbose_proxy_logger.debug(
+                    "Ovalix guardrail: application %s has no %s prompt checkpoint, skipping text inspection",
+                    self._application_id,
+                    input_type,
+                )
             return inputs
         output_texts: Final = await self._check_texts(
             texts,
-            prompt_checkpoint,
+            _kept(plan, ItemKind.MESSAGE, call.messages),
+            _trimmed_text_indices(plan, call.messages),
+            routes.message,
             caller,
-            tool_result_text_indices(structured_messages, texts),
+            caps,
         )
         if output_texts is None:
             return inputs
@@ -488,18 +685,33 @@ class OvalixGuardrail(CustomGuardrail):
     async def _check_texts(
         self,
         texts: Sequence[str],
+        messages: Sequence[tuple[tuple[int, str], _ItemTag]],
+        trimmed: frozenset[int],
         checkpoint_id: str,
         caller: _Caller,
-        skip_indices: frozenset[int],
+        caps: OvalixCaps,
     ) -> list[str] | None:
-        newest_first: Final = tuple(index for index in reversed(range(len(texts))) if index not in skip_indices)
+        """Check the kept messages newest first; trimmed positions reach the model as the placeholder.
+
+        A blocked message blocks the call when it is the newest text, or when it is over the chars cap under a block
+        handling. Any other blocked message is replaced by the block message.
+        """
+        over_cap_blocks: Final = caps.hit_behavior == "block"
         checked: Final = MappingProxyType(
             {
-                index: await self._check_text(texts[index], checkpoint_id, caller, is_newest=index == len(texts) - 1)
-                for index in newest_first
+                index: await self._check_text(
+                    text,
+                    checkpoint_id,
+                    caller,
+                    tag,
+                    blocks_call=index == len(texts) - 1 or (over_cap_blocks and len(text) > caps.message_chars),
+                )
+                for (index, text), tag in reversed(messages)
             }
         )
-        output: Final = [checked.get(index, text) for index, text in enumerate(texts)]
+        output: Final = [
+            _TRIM_PLACEHOLDER if index in trimmed else checked.get(index, text) for index, text in enumerate(texts)
+        ]
         return output if output != list(texts) else None
 
     async def _check_text(
@@ -507,22 +719,14 @@ class OvalixGuardrail(CustomGuardrail):
         content: str,
         checkpoint_id: str,
         caller: _Caller,
-        is_newest: bool,
+        tag: _ItemTag,
+        blocks_call: bool,
     ) -> str:
-        """Return the text that replaces `content` after Ovalix checks it; a blocked newest text raises."""
-        try:
-            resp: Final = await self._call_checkpoint("TEXT", {"content": content}, checkpoint_id, caller)
-        except Exception as e:
-            verbose_proxy_logger.exception("Ovalix checkpoint call failed: %s", e)
-            raise GuardrailRaisedException(
-                guardrail_name=self.guardrail_name,
-                message=f"Ovalix guardrail error: {e}",
-                should_wrap_with_default_message=False,
-            ) from e
-        action, corrected = self._verdict(resp)
+        """Return the text that replaces `content` after Ovalix checks it; a block raises when it blocks the call."""
+        action, corrected = await self._send("TEXT", {"content": content}, checkpoint_id, caller, tag)
         if action == BLOCKED_ACTION_TYPE:
             block_message: Final = corrected or BLOCKED_BY_OVALIX_FALLBACK_MESSAGE
-            if is_newest:
+            if blocks_call:
                 self._block_current_message(block_message)
             return block_message
         if action in _MODIFY_ACTION_TYPES and corrected is not None:

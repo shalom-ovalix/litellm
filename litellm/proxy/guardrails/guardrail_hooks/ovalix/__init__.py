@@ -24,7 +24,7 @@ def initialize_guardrail(litellm_params: "LitellmParams", guardrail: "Guardrail"
     post_tool_checkpoint_id: Final = getattr(litellm_params, "post_tool_checkpoint_id", None)
 
     _ovalix_callback: Final = OvalixGuardrail(
-        guardrail_name=guardrail.get("guardrail_name", ""),
+        guardrail_name=guardrail["guardrail_name"],
         tracker_api_base=tracker_api_base,
         tracker_api_key=tracker_api_key,
         application_id=application_id,

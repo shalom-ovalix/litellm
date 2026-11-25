@@ -2,7 +2,8 @@
 
 The Ovalix tracker is the only guardrail double: an owned wire peer that answers the `/tracking/beta` routes
 the way the live tracker does, including allowing a checkpoint call whose `actor` is empty without inspecting
-it. The provider is a second owned peer. The proxy, Postgres and Redis run for real with two workers.
+it, and serving default caps on its caps route. The provider is a second owned peer. The proxy, Postgres and
+Redis run for real with two workers.
 """
 
 import json
@@ -39,6 +40,17 @@ REPLY: Final = "synthetic provider reply"
 PINNED: Final = "ovalix-pinned"
 ENDPOINTS: Final = ("/v1/chat/completions", "/v1/messages", "/v1/responses")
 CHECKPOINT: Final = "/tracking/beta/checkpoint"
+CAPS: Final = "/tracking/beta/caps"
+DEFAULT_CAPS: Final = {
+    "message_chars": 100000,
+    "messages_per_call": 100,
+    "files_per_call": 10,
+    "tool_calls_per_call": 50,
+    "tool_results_per_call": 50,
+    "call_size_bytes": 67108864,
+    "file_size_bytes": 67108864,
+    "hit_behavior": "block",
+}
 OUTAGE_AFTER: Final = 6
 
 
@@ -89,6 +101,8 @@ def _tracker(request: Request) -> Reply:
     path: Final = urlsplit(request.target).path
     if not OUTAGE.admits(path):
         return Reply(status=503, body=b'{"detail": "tracker unavailable"}')
+    if path == CAPS and request.method == "GET":
+        return Reply(body=json.dumps(DEFAULT_CAPS).encode())
     if path != CHECKPOINT:
         return Reply(status=404, body=b'{"detail": "not found"}')
     return Reply(body=json.dumps(_checkpoint_verdict(json.loads(request.body))).encode())
@@ -299,9 +313,10 @@ def test_a_key_alias_naming_another_app_does_not_change_the_application_checked(
 
     assert response.status_code == 400 and DENIAL in response.text, response.text
     assert rig.provider.drain() == ()
-    calls: Final = [(urlsplit(request.target).path, json.loads(request.body)) for request in rig.tracker.drain()]
+    calls: Final = [(urlsplit(request.target).path, request.body) for request in rig.tracker.drain()]
+    bodies: Final = [(path, json.loads(raw)) for path, raw in calls if path != CAPS]
     assert [
-        (path, body["application_id"], body["checkpoint_id"], "application_name" in body) for path, body in calls
+        (path, body["application_id"], body["checkpoint_id"], "application_name" in body) for path, body in bodies
     ] == [(CHECKPOINT, APP_ID, PRE_CHECKPOINT, False)]
 
 

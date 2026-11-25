@@ -20,6 +20,14 @@ from litellm.proxy.guardrails.guardrail_hooks.ovalix.ovalix import (
     OvalixGuardrailBlockedException,
     OvalixGuardrailMissingSecrets,
     _Caller,
+    _ItemTag,
+)
+from litellm.proxy.guardrails.guardrail_hooks.ovalix.ovalix_caps import (
+    CapLimit,
+    ItemKind,
+    ItemRef,
+    OvalixCaps,
+    plan_caps,
 )
 from litellm.proxy.guardrails.guardrail_hooks.ovalix.ovalix_extraction import FilePart
 from litellm.types.guardrails import GuardrailEventHooks
@@ -81,11 +89,44 @@ def _ovalix_env():
     }
 
 
+_DEFAULT_CAPS: Final = {
+    "message_chars": 100000,
+    "messages_per_call": 100,
+    "files_per_call": 10,
+    "tool_calls_per_call": 50,
+    "tool_results_per_call": 50,
+    "call_size_bytes": 67108864,
+    "file_size_bytes": 67108864,
+    "hit_behavior": "block",
+}
+
+
+def _caps(**overrides):
+    return {**_DEFAULT_CAPS, **overrides}
+
+
+class _CapsRoute:
+    """The tracker's caps route; each test patches in the checkpoint route it needs."""
+
+    def __init__(self, caps=_DEFAULT_CAPS, status=200):
+        self.caps = caps
+        self.status = status
+        self.gets = []
+
+    async def get(self, url, headers=None, timeout=None):
+        self.gets.append((url, headers, timeout))
+        return httpx.Response(self.status, json=self.caps, request=httpx.Request("GET", url))
+
+    async def post(self, url, headers=None, json=None, timeout=None):
+        raise AssertionError(f"unpatched checkpoint call to {url}")
+
+
 def _guardrail_kwargs():
     return {
         "guardrail_name": "ovalix-test",
         "event_hook": "pre_call",
         "default_on": True,
+        "async_handler": _CapsRoute(),
     }
 
 
@@ -224,6 +265,7 @@ class TestOvalixGuardrail:
                     data={"content": "hello"},
                     checkpoint_id="pre-1",
                     caller=_Caller(actor="a1b2c3d4", identity_source="user-id", session_id="session-1"),
+                    tag=_ItemTag(ItemKind.MESSAGE),
                 )
 
             assert result == TRACKER_RESPONSE_ALLOW
@@ -239,6 +281,7 @@ class TestOvalixGuardrail:
             assert body["data_type"] == "TEXT"
             assert body["data"] == {"content": "hello"}
             assert body["tool"] == "LiteLLM"
+            assert body["item_kind"] == "message"
         finally:
             for k in _ovalix_env():
                 if k in os.environ:
@@ -644,9 +687,8 @@ def _mock_tracker(g):
     post_resp = MagicMock()
     post_resp.json.return_value = TRACKER_RESPONSE_ALLOW
     post_resp.raise_for_status = MagicMock()
-    g._async_handler.get = AsyncMock()
     g._async_handler.post = AsyncMock(return_value=post_resp)
-    return g._async_handler.get, g._async_handler.post
+    return g._async_handler, g._async_handler.post
 
 
 _ALLOW = {"action_type": "allow", "modified_data": {"content": "x"}}
@@ -665,6 +707,7 @@ def _static_guardrail():
         guardrail_name="o",
         event_hook="pre_call",
         default_on=True,
+        async_handler=_CapsRoute(),
     )
 
 
@@ -757,7 +800,7 @@ async def test_file_checkpoint_call_routes_to_litellm_file_endpoint():
         return r
 
     with patch.object(g._async_handler, "post", new=_post):
-        await g._call_checkpoint("FILE", {"name": "f.txt", "content": "x"}, "file-1", _CALLER)
+        await g._call_checkpoint("FILE", {"name": "f.txt", "content": "x"}, "file-1", _CALLER, _ItemTag(ItemKind.FILE))
     assert seen["url"] == "https://t/tracking/beta/file_checkpoint"
 
 
@@ -776,7 +819,7 @@ async def test_file_checkpoint_flags_oversize_parts(oversize):
         return r
 
     with patch.object(g._async_handler, "post", new=_post):
-        await g._check_files_for_block([part], "file-1", _CALLER)
+        await g._check_files_for_block([(part, _ItemTag(ItemKind.FILE))], "file-1", _CALLER)
     assert seen["last"]["data"]["content"] is None
     assert seen["last"].get("oversize", False) is oversize
 
@@ -1164,7 +1207,7 @@ def test_get_supported_event_hooks_lists_both():
 async def test_call_checkpoint_requires_application_and_checkpoint():
     g = _static_guardrail()
     with pytest.raises(ValueError, match="application_id or checkpoint_id not resolved"):
-        await g._call_checkpoint("TEXT", {"content": "x"}, "", _CALLER)
+        await g._call_checkpoint("TEXT", {"content": "x"}, "", _CALLER, _ItemTag(ItemKind.MESSAGE))
 
 
 @pytest.mark.asyncio
@@ -1227,6 +1270,7 @@ def _pinned_guardrail(**overrides):
             "guardrail_name": "ovalix-test",
             "event_hook": "pre_call",
             "default_on": True,
+            "async_handler": _CapsRoute(),
             **overrides,
         }
     )
@@ -1253,7 +1297,7 @@ def test_requested_hook_without_its_checkpoint_fails_at_startup(hook, checkpoint
 async def test_key_alias_does_not_change_the_application_checked():
     """The application comes from config alone, so a key alias naming another app changes nothing on the wire."""
     g: Final = _pinned_guardrail(pre_checkpoint_id="pre-1")
-    mock_get, mock_post = _mock_tracker(g)
+    caps_route, mock_post = _mock_tracker(g)
 
     await g.apply_guardrail(
         GenericGuardrailAPIInputs(texts=["hi"]),
@@ -1261,7 +1305,7 @@ async def test_key_alias_does_not_change_the_application_checked():
         "request",
     )
 
-    mock_get.assert_not_called()
+    assert [url for url, _, _ in caps_route.gets] == ["https://tracker.test/tracking/beta/caps"]
     [(body, url)] = _checkpoint_calls(mock_post)
     assert url == "https://tracker.test/tracking/beta/checkpoint"
     assert (body["application_id"], body["checkpoint_id"]) == ("app-1", "pre-1")
@@ -1284,15 +1328,15 @@ async def test_one_sided_config_inspects_configured_direction_only(input_type, i
 
 @pytest.mark.asyncio
 async def test_every_tracker_call_carries_the_configured_timeout():
-    """litellm_params.timeout bounds the checkpoint call."""
+    """litellm_params.timeout bounds the caps fetch and the checkpoint call."""
     g: Final = _pinned_guardrail(pre_checkpoint_id="pre-1", timeout=2.5)
-    mock_get, mock_post = _mock_tracker(g)
+    caps_route, mock_post = _mock_tracker(g)
 
     await g.apply_guardrail(
         inputs=GenericGuardrailAPIInputs(texts=["hi"]), request_data={}, input_type="request", logging_obj=None
     )
 
-    mock_get.assert_not_called()
+    assert [(_route_of(url), timeout) for url, _, timeout in caps_route.gets] == [("caps", 2.5)]
     assert [(_route_of(c.args[0]), c.kwargs["timeout"]) for c in mock_post.call_args_list] == [("checkpoint", 2.5)]
 
 
@@ -1362,7 +1406,7 @@ async def test_call_checkpoint_sends_the_configured_ids_and_no_name_or_direction
     seen, post = _capturing_post()
 
     with patch.object(g._async_handler, "post", new=post):
-        await g._call_checkpoint("TEXT", {"content": "x"}, "pre-1", _CALLER)
+        await g._call_checkpoint("TEXT", {"content": "x"}, "pre-1", _CALLER, _ItemTag(ItemKind.MESSAGE))
 
     assert seen["body"]["application_id"] == "app-1"
     assert seen["body"]["checkpoint_id"] == "pre-1"
@@ -1454,6 +1498,7 @@ def _guardrail_with_tool_checkpoints(**checkpoint_ids):
         guardrail_name="o",
         event_hook="pre_call",
         default_on=True,
+        async_handler=_CapsRoute(),
         **checkpoint_ids,
     )
 
@@ -1582,3 +1627,499 @@ async def test_tool_checkpoint_ids_fall_back_to_env(monkeypatch):
     sent: Final = await _checkpoints_by_item(guardrail, _request_with_tool_history(), "request")
 
     assert [checkpoint for data_type, _, checkpoint in sent if data_type == "TOOL"] == ["pre-tool-env", "post-tool-env"]
+
+
+class _Clock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def _capped_guardrail(caps_route, clock=None):
+    return OvalixGuardrail(
+        tracker_api_base="https://t",
+        tracker_api_key="k",
+        application_id="app-1",
+        pre_checkpoint_id="pre-1",
+        post_checkpoint_id="post-1",
+        guardrail_name="o",
+        event_hook="pre_call",
+        default_on=True,
+        async_handler=caps_route,
+        **({"clock": clock} if clock else {}),
+    )
+
+
+def _checkpoint_bodies_post(verdict=lambda body: _ALLOW):
+    bodies: Final = []
+
+    async def _post(url, headers=None, json=None, timeout=None):
+        bodies.append(json)
+        response = MagicMock()
+        response.json.return_value = verdict(json)
+        response.raise_for_status = MagicMock()
+        return response
+
+    return _post, bodies
+
+
+async def _apply_capped(caps, inputs, input_type="request", verdict=lambda body: _ALLOW):
+    """Apply a guardrail under `caps`; return the result (or the raised exception) and every checkpoint body sent."""
+    route: Final = _CapsRoute(caps)
+    guardrail: Final = _capped_guardrail(route)
+    post, bodies = _checkpoint_bodies_post(verdict)
+    with patch.object(route, "post", new=post):
+        try:
+            result = await guardrail.apply_guardrail(inputs=inputs, request_data={}, input_type=input_type)
+        except GuardrailRaisedException as raised:
+            return raised, bodies
+    return result, bodies
+
+
+def _flags(bodies):
+    return [(body["data"].get("content"), body.get("cap_hit"), body.get("cap_handling")) for body in bodies]
+
+
+_STOP: Final = {"action_type": "block", "modified_data": {"content": "Blocked: over the limit"}}
+
+
+@pytest.mark.asyncio
+async def test_caps_are_read_from_the_tracker_caps_route_with_the_tracker_key():
+    route: Final = _CapsRoute()
+    post, _ = _checkpoint_bodies_post()
+
+    with patch.object(route, "post", new=post):
+        await _capped_guardrail(route).apply_guardrail(GenericGuardrailAPIInputs(texts=["hi"]), {}, "request")
+
+    [(url, headers, _)] = route.gets
+    assert url == "https://t/tracking/beta/caps"
+    assert headers["x-api-key"] == "k"
+
+
+@pytest.mark.asyncio
+async def test_caps_are_refetched_only_once_five_minutes_have_passed():
+    route: Final = _CapsRoute()
+    clock: Final = _Clock(1000.0)
+    guardrail: Final = _capped_guardrail(route, clock)
+    post, _ = _checkpoint_bodies_post()
+
+    with patch.object(route, "post", new=post):
+        await guardrail.apply_guardrail(GenericGuardrailAPIInputs(texts=["hi"]), {}, "request")
+        clock.now = 1299.0
+        await guardrail.apply_guardrail(GenericGuardrailAPIInputs(texts=["hi"]), {}, "request")
+        fetches_before_expiry: Final = len(route.gets)
+        clock.now = 1300.0
+        await guardrail.apply_guardrail(GenericGuardrailAPIInputs(texts=["hi"]), {}, "request")
+
+    assert (fetches_before_expiry, len(route.gets)) == (1, 2)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_refetch_keeps_the_last_caps_for_another_five_minutes():
+    route: Final = _CapsRoute(_caps(messages_per_call=1, hit_behavior="check_up_to_cap"))
+    clock: Final = _Clock(1000.0)
+    guardrail: Final = _capped_guardrail(route, clock)
+    post, bodies = _checkpoint_bodies_post()
+
+    with patch.object(route, "post", new=post):
+        await guardrail.apply_guardrail(GenericGuardrailAPIInputs(texts=["hi"]), {}, "request")
+        route.status = 500
+        clock.now = 1300.0
+        await guardrail.apply_guardrail(GenericGuardrailAPIInputs(texts=["older", "newer"]), {}, "request")
+        clock.now = 1599.0
+        await guardrail.apply_guardrail(GenericGuardrailAPIInputs(texts=["hi"]), {}, "request")
+
+    assert _flags(bodies[1:2]) == [("newer", "messages_per_call", "check_up_to_cap")]
+    assert len(route.gets) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "route",
+    [
+        _CapsRoute(status=503),
+        _CapsRoute(_caps(hit_behavior="warn")),
+        _CapsRoute({key: value for key, value in _DEFAULT_CAPS.items() if key != "file_size_bytes"}),
+        _CapsRoute({key: value for key, value in _DEFAULT_CAPS.items() if key != "message_chars"}),
+    ],
+)
+async def test_without_caps_a_failed_or_invalid_fetch_fails_the_call_like_a_failed_check(route):
+    post, bodies = _checkpoint_bodies_post()
+
+    with patch.object(route, "post", new=post):
+        with pytest.raises(GuardrailRaisedException) as raised:
+            await _capped_guardrail(route).apply_guardrail(GenericGuardrailAPIInputs(texts=["hi"]), {}, "request")
+
+    assert raised.value.message.startswith("Ovalix guardrail error")
+    assert not isinstance(raised.value, OvalixGuardrailBlockedException)
+    assert bodies == []
+
+
+@pytest.mark.asyncio
+async def test_a_call_with_nothing_to_inspect_does_not_fetch_caps():
+    route: Final = _CapsRoute(status=503)
+
+    result: Final = await _capped_guardrail(route).apply_guardrail(
+        GenericGuardrailAPIInputs(texts=[], structured_messages=[]), {}, "request"
+    )
+
+    assert result == GenericGuardrailAPIInputs(texts=[], structured_messages=[])
+    assert route.gets == []
+
+
+_TEN_BYTES_DATA_URL: Final = "data:text/plain;base64," + base64.b64encode(b"0123456789").decode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "inputs, input_type",
+    [
+        (
+            GenericGuardrailAPIInputs(
+                texts=[],
+                structured_messages=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "file", "file": {"filename": "s.txt", "file_data": _TEN_BYTES_DATA_URL}}],
+                    }
+                ],
+            ),
+            "request",
+        ),
+        (GenericGuardrailAPIInputs(texts=[], images=[_TEN_BYTES_DATA_URL]), "response"),
+    ],
+)
+async def test_the_file_size_limit_comes_from_the_caps(inputs, input_type):
+    _, bodies = await _apply_capped(_caps(file_size_bytes=4), inputs, input_type=input_type)
+
+    assert [(body["data"]["content"], body.get("oversize")) for body in bodies] == [(None, True)]
+
+
+@pytest.mark.asyncio
+async def test_over_a_cap_under_block_only_the_newest_message_is_sent_flagged_and_the_call_is_blocked():
+    raised, bodies = await _apply_capped(
+        _caps(messages_per_call=2, hit_behavior="block"),
+        GenericGuardrailAPIInputs(texts=["one", "two", "three"]),
+        verdict=lambda body: _STOP,
+    )
+
+    assert isinstance(raised, OvalixGuardrailBlockedException)
+    assert raised.message == "Blocked: over the limit"
+    assert [(body["item_kind"], *flags) for body, flags in zip(bodies, _flags(bodies))] == [
+        ("message", "three", "messages_per_call", "block")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_over_a_cap_under_block_the_trackers_verdict_on_the_newest_item_decides_the_call():
+    """The tracker turns the cap into the action, so it can pass the item, e.g. on a monitor-only checkpoint."""
+    inputs: Final = GenericGuardrailAPIInputs(texts=["one", "two"])
+
+    result, bodies = await _apply_capped(_caps(messages_per_call=1, hit_behavior="block"), inputs)
+
+    assert result == inputs
+    assert _flags(bodies) == [("two", "messages_per_call", "block")]
+
+
+@pytest.mark.asyncio
+async def test_over_a_cap_under_allow_the_whole_call_passes_and_only_the_newest_message_is_reported():
+    inputs: Final = GenericGuardrailAPIInputs(texts=["leak-me", "two", "three"])
+
+    result, bodies = await _apply_capped(
+        _caps(messages_per_call=2, hit_behavior="allow"),
+        inputs,
+        verdict=lambda body: _BLOCK if body["data"]["content"] == "leak-me" else _ALLOW,
+    )
+
+    assert result == inputs
+    assert _flags(bodies) == [("three", "messages_per_call", "allow")]
+
+
+@pytest.mark.asyncio
+async def test_over_a_cap_under_check_up_to_cap_only_the_newest_items_are_inspected():
+    inputs: Final = GenericGuardrailAPIInputs(texts=["one", "two", "three"])
+
+    result, bodies = await _apply_capped(
+        _caps(messages_per_call=2, hit_behavior="check_up_to_cap"),
+        inputs,
+        verdict=lambda body: _BLOCK if body["data"]["content"] == "one" else _ALLOW,
+    )
+
+    assert result == inputs
+    assert _flags(bodies) == [("three", "messages_per_call", "check_up_to_cap"), ("two", None, None)]
+
+
+@pytest.mark.asyncio
+async def test_over_a_cap_under_trim_dropped_messages_reach_the_model_as_the_placeholder():
+    result, bodies = await _apply_capped(
+        _caps(messages_per_call=2, hit_behavior="trim"), GenericGuardrailAPIInputs(texts=["one", "two", "three"])
+    )
+
+    assert result["texts"] == ["[Removed: over the inspection limit]", "two", "three"]
+    assert _flags(bodies) == [("three", "messages_per_call", "trim"), ("two", None, None)]
+
+
+@pytest.mark.asyncio
+async def test_under_block_a_blocked_older_message_over_the_chars_cap_blocks_the_whole_call():
+    raised, _ = await _apply_capped(
+        _caps(message_chars=10, hit_behavior="block"),
+        GenericGuardrailAPIInputs(texts=["x" * 11, "newest"]),
+        verdict=lambda body: _STOP if body["data"]["content"] == "x" * 11 else _ALLOW,
+    )
+
+    assert isinstance(raised, OvalixGuardrailBlockedException)
+    assert raised.message == "Blocked: over the limit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hit_behavior, older",
+    [("block", "x" * 10), ("trim", "x" * 11), ("check_up_to_cap", "x" * 11), ("allow", "x" * 11)],
+)
+async def test_any_other_blocked_older_message_is_replaced_and_the_call_goes_on(hit_behavior, older):
+    result, _ = await _apply_capped(
+        _caps(message_chars=10, hit_behavior=hit_behavior),
+        GenericGuardrailAPIInputs(texts=[older, "newest"]),
+        verdict=lambda body: _STOP if body["data"]["content"] == older else _ALLOW,
+    )
+
+    assert result["texts"] == ["Blocked: over the limit", "newest"]
+
+
+def _request_with_two_tool_rounds():
+    return GenericGuardrailAPIInputs(
+        texts=["what is the weather", "sunny", "rainy", "and tomorrow?"],
+        structured_messages=[
+            {"role": "user", "content": "what is the weather"},
+            {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "get_weather", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "c2", "function": {"name": "get_forecast", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "c2", "content": "rainy"},
+            {"role": "user", "content": "and tomorrow?"},
+        ],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "over_cap, cap_hit",
+    [({"tool_calls_per_call": 1}, "tool_calls_per_call"), ({"tool_results_per_call": 1}, "tool_results_per_call")],
+)
+async def test_a_trim_that_would_drop_a_tool_item_is_handled_as_block(over_cap, cap_hit):
+    raised, bodies = await _apply_capped(
+        _caps(hit_behavior="trim", **over_cap), _request_with_two_tool_rounds(), verdict=lambda body: _STOP
+    )
+
+    assert isinstance(raised, OvalixGuardrailBlockedException)
+    assert _flags(bodies) == [("and tomorrow?", cap_hit, "block")]
+
+
+@pytest.mark.asyncio
+async def test_a_trim_that_would_drop_a_file_is_handled_as_block():
+    attachment: Final = {"type": "file", "file": {"filename": "a.txt", "file_data": base64.b64encode(b"a").decode()}}
+    inputs: Final = GenericGuardrailAPIInputs(
+        texts=["see both"],
+        structured_messages=[
+            {"role": "user", "content": [attachment, {**attachment}, {"type": "text", "text": "see both"}]}
+        ],
+    )
+
+    raised, bodies = await _apply_capped(
+        _caps(files_per_call=1, hit_behavior="trim"), inputs, verdict=lambda body: _STOP
+    )
+
+    assert isinstance(raised, OvalixGuardrailBlockedException)
+    assert _flags(bodies) == [("see both", "files_per_call", "block")]
+
+
+@pytest.mark.asyncio
+async def test_over_the_file_cap_the_newest_message_carries_the_flags_and_only_the_newest_file_is_inspected():
+    def attachment(name, raw):
+        return {"type": "file", "file": {"filename": name, "file_data": base64.b64encode(raw).decode()}}
+
+    inputs: Final = GenericGuardrailAPIInputs(
+        texts=["compare them"],
+        structured_messages=[
+            {"role": "user", "content": [attachment("old.txt", b"old")]},
+            {
+                "role": "user",
+                "content": [attachment("new.txt", b"new"), {"type": "text", "text": "compare them"}],
+            },
+        ],
+    )
+
+    _, bodies = await _apply_capped(_caps(files_per_call=1, hit_behavior="check_up_to_cap"), inputs)
+
+    assert [
+        (body["item_kind"], body["data"].get("name", body["data"].get("content")), body.get("cap_hit"))
+        for body in bodies
+    ] == [("file", "new.txt", None), ("message", "compare them", "files_per_call")]
+
+
+@pytest.mark.asyncio
+async def test_without_messages_the_newest_item_of_the_over_cap_kind_is_reported():
+    def call(call_id, name):
+        return {"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}
+
+    raised, bodies = await _apply_capped(
+        _caps(tool_calls_per_call=1, hit_behavior="block"),
+        GenericGuardrailAPIInputs(texts=[], tool_calls=[call("c1", "first"), call("c2", "second")]),
+        input_type="response",
+        verdict=lambda body: _STOP,
+    )
+
+    assert isinstance(raised, OvalixGuardrailBlockedException)
+    assert [(body["item_kind"], body["data"]["tool_name"], body["cap_hit"]) for body in bodies] == [
+        ("tool_call", "second", "tool_calls_per_call")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caps, cap_hit",
+    [
+        (_caps(messages_per_call=1, files_per_call=1, call_size_bytes=1), "messages_per_call"),
+        (_caps(files_per_call=1, tool_calls_per_call=1, call_size_bytes=1), "files_per_call"),
+        (_caps(tool_calls_per_call=1, tool_results_per_call=1, call_size_bytes=1), "tool_calls_per_call"),
+        (_caps(tool_results_per_call=1, call_size_bytes=1), "tool_results_per_call"),
+        (_caps(call_size_bytes=1), "call_size"),
+    ],
+)
+async def test_the_first_cap_hit_in_the_fixed_order_is_the_one_recorded(caps, cap_hit):
+    attachment: Final = {"type": "file", "file": {"filename": "a.txt", "file_data": base64.b64encode(b"a").decode()}}
+    inputs: Final = GenericGuardrailAPIInputs(
+        texts=["what is the weather", "sunny", "rainy", "and tomorrow?"],
+        structured_messages=[
+            *_request_with_two_tool_rounds()["structured_messages"][:-1],
+            {"role": "user", "content": [attachment, {**attachment}, {"type": "text", "text": "and tomorrow?"}]},
+        ],
+    )
+
+    _, bodies = await _apply_capped({**caps, "hit_behavior": "allow"}, inputs)
+
+    assert [body["cap_hit"] for body in bodies] == [cap_hit]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_or_blank_text_is_left_as_sent_and_not_counted_as_a_message():
+    inputs: Final = GenericGuardrailAPIInputs(texts=["", " \n\t", "hi"])
+
+    result, bodies = await _apply_capped(_caps(messages_per_call=1, hit_behavior="allow"), inputs)
+
+    assert result == inputs
+    assert _flags(bodies) == [("hi", None, None)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text, capped", [("hello", False), ("héllo", True)])
+async def test_the_call_size_counts_utf8_bytes(text, capped):
+    _, bodies = await _apply_capped(
+        _caps(call_size_bytes=5, hit_behavior="allow"), GenericGuardrailAPIInputs(texts=[text])
+    )
+
+    assert _flags(bodies) == [(text, "call_size", "allow") if capped else (text, None, None)]
+
+
+def _plan_caps(sizes, **caps):
+    return plan_caps(sizes, OvalixCaps.model_validate(_caps(**caps)))
+
+
+def test_the_size_budget_keeps_items_newest_message_first_until_one_does_not_fit():
+    sizes: Final = {
+        ItemKind.MESSAGE: (5, 5, 5),
+        ItemKind.TOOL_RESULT: (3,),
+        ItemKind.TOOL_CALL: (1,),
+        ItemKind.FILE: (1,),
+    }
+
+    plan: Final = _plan_caps(sizes, call_size_bytes=10, hit_behavior="check_up_to_cap")
+
+    assert plan.cap_hit is CapLimit.CALL_SIZE
+    assert plan.kept == frozenset({ItemRef(ItemKind.MESSAGE, 2), ItemRef(ItemKind.MESSAGE, 1)})
+
+
+@pytest.mark.parametrize(
+    "sizes, kept",
+    [
+        ({ItemKind.MESSAGE: (4, 1), ItemKind.TOOL_RESULT: (1,)}, {ItemRef(ItemKind.MESSAGE, 1)}),
+        (
+            {ItemKind.MESSAGE: (1,), ItemKind.TOOL_RESULT: (4,), ItemKind.TOOL_CALL: (1,)},
+            {ItemRef(ItemKind.MESSAGE, 0)},
+        ),
+        ({ItemKind.MESSAGE: (1,), ItemKind.TOOL_CALL: (4,), ItemKind.FILE: (1,)}, {ItemRef(ItemKind.MESSAGE, 0)}),
+    ],
+)
+def test_the_size_budget_walks_messages_then_tool_results_then_tool_calls_then_files(sizes, kept):
+    """The walk stops at the first item that does not fit, so a smaller item later in the order is dropped too."""
+    assert _plan_caps(sizes, call_size_bytes=4, hit_behavior="check_up_to_cap").kept == frozenset(kept)
+
+
+@pytest.mark.parametrize(
+    "sizes, newest",
+    [
+        ({ItemKind.TOOL_RESULT: (1,), ItemKind.TOOL_CALL: (1,), ItemKind.FILE: (1,)}, ItemRef(ItemKind.TOOL_RESULT, 0)),
+        ({ItemKind.TOOL_CALL: (1, 1), ItemKind.FILE: (1,)}, ItemRef(ItemKind.TOOL_CALL, 1)),
+        ({ItemKind.FILE: (1, 1, 1)}, ItemRef(ItemKind.FILE, 2)),
+    ],
+)
+def test_over_the_size_cap_without_messages_the_newest_item_is_of_the_first_kind_in_the_size_budget_order(
+    sizes, newest
+):
+    assert _plan_caps(sizes, call_size_bytes=2, hit_behavior="check_up_to_cap").newest == newest
+
+
+def test_the_size_budget_applies_after_the_count_caps():
+    sizes: Final = {ItemKind.MESSAGE: (1, 1, 1, 1), ItemKind.FILE: (2,)}
+
+    plan: Final = _plan_caps(sizes, messages_per_call=2, call_size_bytes=3, hit_behavior="check_up_to_cap")
+
+    assert plan.cap_hit is CapLimit.MESSAGES_PER_CALL
+    assert plan.kept == frozenset({ItemRef(ItemKind.MESSAGE, 3), ItemRef(ItemKind.MESSAGE, 2)})
+
+
+def test_the_newest_message_is_kept_even_when_it_alone_is_over_the_size_budget():
+    plan: Final = _plan_caps({ItemKind.MESSAGE: (1, 50)}, call_size_bytes=10, hit_behavior="trim")
+
+    assert (plan.kept, plan.newest, plan.handling) == (
+        frozenset({ItemRef(ItemKind.MESSAGE, 1)}),
+        ItemRef(ItemKind.MESSAGE, 1),
+        "trim",
+    )
+
+
+def test_a_call_within_every_cap_keeps_every_item_unflagged():
+    sizes: Final = {ItemKind.MESSAGE: (1, 1), ItemKind.TOOL_CALL: (1,), ItemKind.TOOL_RESULT: (1,), ItemKind.FILE: (1,)}
+
+    plan: Final = _plan_caps(
+        sizes, messages_per_call=2, files_per_call=1, tool_calls_per_call=1, tool_results_per_call=1, call_size_bytes=5
+    )
+
+    assert (len(plan.kept), plan.newest, plan.cap_hit, plan.handling) == (5, None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_every_checkpoint_request_names_its_item_kind_and_only_a_capped_newest_item_carries_cap_fields():
+    data_url: Final = "data:text/plain;base64," + base64.b64encode(b"secret").decode()
+    inputs: Final = GenericGuardrailAPIInputs(
+        texts=["sunny", "thanks"],
+        structured_messages=[
+            {"role": "user", "content": [{"type": "file", "file": {"filename": "s.txt", "file_data": data_url}}]},
+            {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "get_weather", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+            {"role": "user", "content": "thanks"},
+        ],
+    )
+
+    _, bodies = await _apply_capped(_DEFAULT_CAPS, inputs)
+
+    assert [(body["data_type"], body["item_kind"], "cap_hit" in body, "cap_handling" in body) for body in bodies] == [
+        ("FILE", "file", False, False),
+        ("TOOL", "tool_call", False, False),
+        ("TOOL", "tool_result", False, False),
+        ("TEXT", "message", False, False),
+    ]

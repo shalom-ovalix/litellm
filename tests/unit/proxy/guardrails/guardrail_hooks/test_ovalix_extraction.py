@@ -441,3 +441,25 @@ def test_tool_result_text_indices_skips_blank_tool_content_never_submitted_as_to
 
 def test_tool_result_text_indices_empty_without_structured_messages():
     assert tool_result_text_indices(None, ["ask"]) == frozenset()
+
+
+def test_a_decoded_file_counts_its_decoded_bytes():
+    parts = extract_file_parts_from_messages(_msgs({"type": "file", "file": {"file_data": _b64(b"12345")}}), 1000)
+    assert [part.size for part in parts] == [5]
+
+
+def test_an_oversize_file_counts_its_base64_length_times_three_quarters_minus_padding():
+    big = _b64(b"x" * 100)
+    assert big.endswith("=")
+    parts = extract_file_parts_from_images([f"data:image/png;base64,{big}"], size_limit=10)
+    assert [(part.oversize, part.size) for part in parts] == [(True, 100)]
+
+
+def test_a_file_over_the_limit_found_after_decoding_counts_its_decoded_bytes():
+    parts = extract_file_parts_from_messages(_msgs({"type": "file", "file": {"file_data": _b64(b"abc")}}), 2)
+    assert [(part.oversize, part.size) for part in parts] == [(True, 3)]
+
+
+def test_a_file_sent_by_url_counts_zero_bytes():
+    parts = extract_file_parts_from_images(["https://x.test/pic.png"], size_limit=1000)
+    assert [part.size for part in parts] == [0]
